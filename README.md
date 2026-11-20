@@ -95,7 +95,7 @@ Firmware ──> ramfence.efi ────────────────�
 - Windows 10 or 11, 64-bit, and administrator rights.
 - **Secure Boot turned off.** `ramfence.efi` is not signed by Microsoft, so the
   firmware refuses to start it while Secure Boot is on. (Advanced users can
-  instead enroll the hash of their `ramfence.efi` in the firmware's `db`.)
+  keep Secure Boot on: see [Using Secure Boot](#using-secure-boot-advanced).)
 - If **BitLocker** (or Windows "device encryption") is on: your recovery key.
   Changing the boot path makes BitLocker ask for it unless BitLocker is paused
   first. The wizard shows the key and can pause BitLocker for you.
@@ -165,6 +165,85 @@ timeout 3                       # seconds the summary stays on screen
 - It is a quick check, not a replacement for a thorough MemTest86 run. Weak
   memory may only fail sometimes (for example when warm): run several passes
   before shrinking a protected range.
+
+## Using Secure Boot (advanced)
+
+> [!WARNING]
+> **Changing Secure Boot keys can leave the PC unable to start.** A wrong
+> choice in the firmware's key settings can lock out Windows itself, and
+> BitLocker may ask for the recovery key. Firmware menus differ between
+> makers and models, so this section only describes the general method.
+> **If you are not familiar with firmware (BIOS) settings, do not try this.**
+> Leaving Secure Boot off is the supported setup. If you need Secure Boot,
+> ask someone experienced with PCs, or an AI agent, to help you with the
+> steps for your specific model.
+
+With Secure Boot on, the firmware only starts programs that are signed by a
+trusted certificate or whose hash is listed in the **`db`** ("Authorized
+Signatures") database. `ramfence.efi` is not signed by Microsoft, but you can
+add its hash to `db`. Windows Boot Manager, which RAMFence starts next, is
+signed by Microsoft and keeps working.
+
+### Before you start
+
+- Install RAMFence with Secure Boot **off** and check that the Status tab says
+  *Protected*. That way you know RAMFence itself works.
+- If BitLocker is on: save the recovery key somewhere outside this PC, and
+  pause BitLocker (the Setup tab can do both). Changing Secure Boot settings
+  or keys changes what BitLocker measures at startup.
+- Copy `%ProgramFiles%\RAMFence\ramfence.efi` to a FAT32 USB stick. This is
+  the exact file that is installed; the hash must be of this file.
+- Find out how to undo the change on your PC (see *If something goes wrong*
+  below) before you change anything.
+
+### General steps
+
+1. Restart into the firmware settings (the Setup tab can do this, or press the
+   setup key at the maker's logo, often F2 or Del).
+2. Find the Secure Boot settings, usually under *Security*, *Boot* or
+   *Authentication*. On some PCs you must first change the Secure Boot mode
+   from *Standard* to *Custom* to edit keys.
+3. Open the key management and select **`db`** (*Authorized Signatures*).
+4. Choose **Append** / **Add**, never *Set*, *Replace*, *Delete* or *Clear*:
+   those can remove Microsoft's certificates, and then Windows will not start.
+   Do not change `PK`, `KEK` or `dbx`.
+5. Select `ramfence.efi` on the USB stick. If the firmware asks for the type,
+   choose the EFI image (PE/COFF) option: the firmware then computes the
+   correct hash itself. The hash is an Authenticode image hash, **not** the
+   SHA-256 of the whole file. If your firmware only accepts certificates or
+   signature lists, it cannot add the file directly; stop here unless you know
+   how to create a signature list.
+6. Turn Secure Boot on, save and restart.
+7. Check: the RAMFence summary appears during startup, the Status tab says
+   *Protected*, and *System Information* (`msinfo32`) shows *Secure Boot
+   State: On*. Resume BitLocker if you paused it.
+
+### Updating RAMFence later
+
+Every new version of `ramfence.efi` has a different hash. If the firmware does
+not know the new hash, it refuses to start RAMFence and usually starts Windows
+Boot Manager instead: **Windows then runs without protection**. To update:
+turn Secure Boot off, update RAMFence, add the new file's hash to `db` as
+above, then turn Secure Boot on again. Changing `ramfence.cfg` (ranges and
+settings) does not change the hash.
+
+A firmware (BIOS) update or *Restore factory keys* resets `db` and removes the
+hash, with the same result. The logon check notices a start without RAMFence
+and warns you, but only after that unprotected start.
+
+Experts can instead create their own signing key, add its certificate to `db`
+and sign `ramfence.efi` with it. Updates then only need to be signed again,
+not enrolled again. Keep that private key safe: anything signed with it is
+trusted by the PC.
+
+### If something goes wrong
+
+- **The PC does not start Windows, or shows a security violation:** enter the
+  firmware settings again and turn Secure Boot off.
+- **Windows itself is refused (keys damaged):** use the firmware's *Restore
+  factory keys* / *Install default Secure Boot keys* option. This restores
+  Microsoft's keys and removes your entry for `ramfence.efi`.
+- **BitLocker asks for the recovery key:** enter the key you saved.
 
 ## Uninstalling
 
