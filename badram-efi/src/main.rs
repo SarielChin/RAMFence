@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod chainload;
 mod console;
+mod memtest;
 mod reserve;
 
 use alloc::format;
@@ -30,6 +31,10 @@ use console::{Decision, Log};
 const CONFIG_NAME: &str = "badram.cfg";
 const DEFAULT_CHAINLOAD: &str = "\\EFI\\Microsoft\\Boot\\bootmgfw.efi";
 
+/// Feature marker that BadRAM Manager looks for in the installed binary to
+/// tell whether this badram.efi supports memory tests.
+static FEATURES: [u8; 26] = *b"BADRAM-FEATURES: memtest1\0";
+
 /// Vendor GUID of the `BadRamStatus` variable (DESIGN.md §2.5).
 pub const STATUS_VENDOR: VariableVendor =
     VariableVendor(guid!("5b7c3f1e-9a42-4d8e-b6a1-2f0c8e4d7a93"));
@@ -39,6 +44,8 @@ fn main() -> Status {
     if uefi::helpers::init().is_err() {
         return Status::ABORTED;
     }
+    // Keep the feature marker in the binary.
+    core::hint::black_box(&FEATURES);
     // Firmware arms a 5-minute watchdog before starting a boot option; turn
     // it off so the error prompt can wait. bootmgr arms its own.
     let _ = boot::set_watchdog_timer(0, 0x10000, None);
@@ -61,6 +68,10 @@ fn main() -> Status {
         .as_ref()
         .and_then(|c| c.chainload.clone())
         .unwrap_or_else(|| DEFAULT_CHAINLOAD.to_string());
+
+    // A scheduled memory test runs before anything is reserved, so it can
+    // also cover the configured bad ranges themselves.
+    let tested = image_dir().is_ok_and(|dir| memtest::run_if_requested(&dir, &mut log));
 
     let mut ranges: Vec<Range> = Vec::new();
     let mut outcome = reserve::Outcome::default();
@@ -107,6 +118,8 @@ fn main() -> Status {
         log.info(summary);
     }
 
+    // Leave a memory test summary on screen long enough to read.
+    let timeout = if tested { timeout.max(30) } else { timeout };
     let decision = if log.is_ok() {
         console::countdown(timeout);
         Decision::Boot

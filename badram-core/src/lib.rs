@@ -13,6 +13,7 @@ extern crate alloc;
 
 pub mod config;
 pub mod memmap;
+pub mod memtest;
 pub mod range;
 pub mod status;
 

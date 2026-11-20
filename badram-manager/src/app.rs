@@ -19,8 +19,13 @@ const DEFAULT_CHAINLOAD: &str = r"\EFI\Microsoft\Boot\bootmgfw.efi";
 enum Tab {
     Status,
     Config,
+    MemTest,
     Install,
 }
+
+/// Default margin around configured ranges for a scheduled test.
+const DEFAULT_MARGIN_MIB: u64 = 256;
+const MIB: u64 = 1024 * 1024;
 
 enum JobMsg {
     Line(String),
@@ -37,6 +42,7 @@ enum Confirm {
     Uninstall,
     ApplyConfig,
     RemoveLimit,
+    Restart,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -128,6 +134,49 @@ pub struct ManagerApp {
     job: Option<Job>,
     log: Vec<(LineKind, String)>,
     confirm: Option<Confirm>,
+    mt: MemTestState,
+}
+
+struct MemTestState {
+    rows: Vec<RangeRow>,
+    passes: u32,
+    /// Margin added around the error extent for the suggested range.
+    suggest_margin_mib: u64,
+    files: Option<Result<ops::TestFiles, String>>,
+    rx: Option<Receiver<Result<ops::TestFiles, String>>>,
+    loaded_once: bool,
+}
+
+impl MemTestState {
+    /// Scan ranges: each configured bad range widened by the default margin.
+    fn rows_around(cfg: Option<&Config>) -> Vec<RangeRow> {
+        let ranges = cfg.and_then(|c| range::normalize(&c.ranges).ok()).unwrap_or_default();
+        let mut rows: Vec<RangeRow> = ranges
+            .iter()
+            .map(|r| {
+                let m = DEFAULT_MARGIN_MIB * MIB;
+                RangeRow {
+                    start: format!("{:#x}", r.start().saturating_sub(m) & !(MIB - 1)),
+                    end: format!("{:#x}", r.end().saturating_add(m).div_ceil(MIB) * MIB),
+                }
+            })
+            .collect();
+        if rows.is_empty() {
+            rows.push(RangeRow::default());
+        }
+        rows
+    }
+
+    fn request(&self) -> Result<String, String> {
+        let mut text = String::new();
+        for (i, row) in self.rows.iter().enumerate() {
+            let r = Editor::row_range(row).map_err(|e| format!("range {}: {e}", i + 1))?;
+            text.push_str(&format!("scan {:#x} {:#x}\n", r.start(), r.end()));
+        }
+        text.push_str(&format!("passes {}\n", self.passes));
+        badram_core::memtest::parse_request(&text).map_err(|e| e.to_string())?;
+        Ok(text)
+    }
 }
 
 fn level_color(l: Level) -> Color32 {
@@ -152,9 +201,18 @@ impl ManagerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_fallback(&cc.egui_ctx);
         let mut editor = Editor::new();
-        if let Some(Ok(c)) = sysstatus::load_installed_config() {
-            editor.load(&c, format!("installed ({})", paths::installed_cfg().display()));
+        let installed = sysstatus::load_installed_config().and_then(Result::ok);
+        if let Some(c) = &installed {
+            editor.load(c, format!("installed ({})", paths::installed_cfg().display()));
         }
+        let mt = MemTestState {
+            rows: MemTestState::rows_around(installed.as_ref()),
+            passes: 1,
+            suggest_margin_mib: DEFAULT_MARGIN_MIB,
+            files: None,
+            rx: None,
+            loaded_once: false,
+        };
         let mut app = ManagerApp {
             tab: Tab::Status,
             status: None,
@@ -166,6 +224,7 @@ impl ManagerApp {
             job: None,
             log: Vec::new(),
             confirm: None,
+            mt,
         };
         app.refresh(&cc.egui_ctx);
         app
@@ -235,10 +294,33 @@ impl ManagerApp {
                 }
             }
         }
+        if let Some(rx) = &self.mt.rx
+            && let Ok(f) = rx.try_recv()
+        {
+            self.mt.files = Some(f);
+            self.mt.rx = None;
+        }
         if finished {
             self.job = None;
             self.refresh(ctx);
+            if self.tab == Tab::MemTest {
+                self.load_test_files(ctx);
+            }
         }
+    }
+
+    fn load_test_files(&mut self, ctx: &egui::Context) {
+        if self.mt.rx.is_some() {
+            return;
+        }
+        self.mt.loaded_once = true;
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ops::read_test_files());
+            ctx.request_repaint();
+        });
+        self.mt.rx = Some(rx);
     }
 
     fn installed(&self) -> bool {
@@ -579,6 +661,8 @@ impl ManagerApp {
             Confirm::ApplyConfig => ("Apply configuration?", "badram.cfg on the ESP is replaced. The new ranges take effect on the next boot.".into()),
             Confirm::RemoveLimit => ("Remove memory limit?", "truncatememory is removed from the running Windows entry, so Windows uses all memory \
                  badram.efi does not reserve.\n\nOnly do this while BadRAM protection is verified.".into()),
+            Confirm::Restart => ("Restart now?", "Windows restarts immediately. Save your work first.\n\n\
+                 The scheduled memory test runs before Windows starts; press Esc on that screen to abort it.".into()),
         };
         let mut decision = None;
         egui::Modal::new(egui::Id::unique("badram-confirm")).show(ctx, |ui| {
@@ -625,6 +709,201 @@ impl ManagerApp {
                 self.start_job(ctx, "Apply configuration", move |log| ops::apply_config(&text, log));
             }
             Confirm::RemoveLimit => self.start_job(ctx, "Remove memory limit", ops::remove_memory_limit),
+            Confirm::Restart => self.start_job(ctx, "Restart", ops::restart_now),
+        }
+    }
+
+    // ----------------------------------------------------------- Memory test
+
+    fn memtest_tab(&mut self, ui: &mut egui::Ui) {
+        if !self.mt.loaded_once && self.elevated() {
+            self.load_test_files(ui.ctx());
+        }
+        ui.label(
+            "badram.efi can test memory once, before Windows starts, including the reserved bad \
+             ranges (Windows itself can never reach them). Schedule a test, restart, and the \
+             results appear below. It is quick and covers a few passes; MemTest86 remains the \
+             thorough reference.",
+        );
+        ui.add_space(8.0);
+
+        ui.strong("Scan ranges");
+        const FIELD: [f32; 2] = [180.0, 22.0];
+        let mut remove = None;
+        for (i, row) in self.mt.rows.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add_sized(FIELD, egui::TextEdit::singleline(&mut row.start).font(egui::TextStyle::Monospace).hint_text("start"));
+                ui.add_sized(FIELD, egui::TextEdit::singleline(&mut row.end).font(egui::TextStyle::Monospace).hint_text("end"));
+                match Editor::row_range(row) {
+                    Ok(r) => ui.label(report::size(r.len())),
+                    Err(e) => ui.colored_label(level_color(Level::Bad), e),
+                };
+                if ui.small_button("✖").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.mt.rows.remove(i);
+            if self.mt.rows.is_empty() {
+                self.mt.rows.push(RangeRow::default());
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("+ Add range").clicked() {
+                self.mt.rows.push(RangeRow::default());
+            }
+            if ui.button(format!("Reset to configured ranges ± {DEFAULT_MARGIN_MIB} MiB")).clicked() {
+                let cfg = self.editor.build().ok();
+                self.mt.rows = MemTestState::rows_around(cfg.as_ref());
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Passes:");
+            ui.add(egui::DragValue::new(&mut self.mt.passes).range(1..=badram_core::memtest::MAX_PASSES));
+            ui.label(RichText::new("each pass writes and verifies every word 12 times").weak());
+        });
+        ui.add_space(6.0);
+
+        let request = self.mt.request();
+        if let Err(e) = &request {
+            ui.colored_label(level_color(Level::Bad), format!("✖ {e}"));
+        }
+        let pending = matches!(&self.mt.files, Some(Ok(f)) if f.pending);
+        let unsupported = matches!(&self.mt.files, Some(Ok(f)) if !f.efi_supports_test);
+        if unsupported {
+            ui.colored_label(
+                level_color(Level::Warn),
+                "⚠ The installed badram.efi is too old to run memory tests. Update the installation \
+                 (Install tab → Update installation) first.",
+            );
+        }
+        let can_act = self.installed() && self.elevated() && !self.busy() && !unsupported;
+        ui.horizontal(|ui| {
+            let resp = ui.add_enabled(can_act && request.is_ok(), egui::Button::new(RichText::new("Schedule test for next boot").strong()));
+            let resp = if self.installed() { resp } else { resp.on_disabled_hover_text("BadRAM is not installed.") };
+            if resp.clicked()
+                && let Ok(text) = request.clone()
+            {
+                self.start_job(ui.ctx(), "Schedule memory test", move |log| ops::schedule_test(&text, log));
+            }
+            if pending && ui.add_enabled(can_act, egui::Button::new("Cancel scheduled test")).clicked() {
+                self.start_job(ui.ctx(), "Cancel memory test", ops::cancel_test);
+            }
+            if ui.add_enabled(!self.busy(), egui::Button::new("Restart now…")).clicked() {
+                self.confirm = Some(Confirm::Restart);
+            }
+        });
+        if pending {
+            ui.colored_label(level_color(Level::Warn), "⚠ A memory test is scheduled for the next boot.");
+        }
+        ui.add_space(10.0);
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.strong("Last result");
+            if ui.add_enabled(self.mt.rx.is_none() && self.elevated(), egui::Button::new("⟳ Reload")).clicked() {
+                self.load_test_files(ui.ctx());
+            }
+            if self.mt.rx.is_some() {
+                ui.spinner();
+            }
+        });
+        let files = self.mt.files.clone();
+        match files {
+            None if !self.elevated() => {
+                ui.label("Run as administrator to read results from the EFI System Partition.");
+            }
+            None => {}
+            Some(Err(e)) => {
+                ui.colored_label(level_color(Level::Bad), e);
+            }
+            Some(Ok(f)) => match f.result {
+                None => {
+                    ui.label("No result yet.");
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(level_color(Level::Bad), e);
+                }
+                Some(Ok(r)) => self.show_result(ui, &r),
+            },
+        }
+    }
+
+    fn show_result(&mut self, ui: &mut egui::Ui, r: &badram_core::memtest::TestResult) {
+        let e = &r.errors;
+        let untested: u64 = r.untested.iter().map(|u| u.range.len()).sum();
+        let (level, headline) = match (r.completed, e.count) {
+            (false, _) => (Level::Warn, format!("Aborted after finding {} error(s).", e.count)),
+            (true, 0) => (Level::Good, "No errors found.".to_string()),
+            (true, n) => (Level::Bad, format!("{n} error(s) found.")),
+        };
+        ui.label(RichText::new(format!("{}  {headline}", level_icon(level))).size(15.0).strong().color(level_color(level)));
+        egui::Grid::new("mt_result").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.strong("Tested");
+            ui.label(format!("{} in {} region(s), {} pass(es)", report::size(r.tested_bytes()), r.tested.len(), r.passes));
+            ui.end_row();
+            ui.strong("Untested");
+            ui.label(if untested == 0 { "none".to_string() } else { format!("{} (in use by firmware or not RAM)", report::size(untested)) });
+            ui.end_row();
+            if let (Some(lo), Some(hi)) = (e.lowest, e.highest) {
+                ui.strong("Error extent");
+                ui.monospace(format!("{lo:#x} – {hi:#x}"));
+                ui.end_row();
+                ui.strong("Error mask");
+                ui.monospace(format!("{:#018x}", e.mask));
+                ui.end_row();
+            }
+        });
+        ui.add_space(6.0);
+        let protected = self.editor.build().ok()
+            .and_then(|c| range::normalize(&c.ranges).ok())
+            .unwrap_or_default();
+        histogram(ui, r, &protected);
+        ui.horizontal(|ui| {
+            for (color, text) in [
+                (level_color(Level::Bad), "errors (per 64 MiB)"),
+                (Color32::from_rgb(0x3a, 0x7b, 0xd5), "configured bad range"),
+                (level_color(Level::Good), "tested"),
+                (Color32::GRAY, "untested"),
+            ] {
+                ui.colored_label(color, "■");
+                ui.label(RichText::new(text).small());
+            }
+        });
+
+        if e.count > 0 {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Suggested bad range, margin");
+                ui.add(egui::DragValue::new(&mut self.mt.suggest_margin_mib).range(0..=4096).suffix(" MiB"));
+            });
+            if let Some(s) = e.suggested_range(self.mt.suggest_margin_mib * MIB, MIB) {
+                ui.horizontal(|ui| {
+                    ui.monospace(format!("range {:#x} {:#x}   ({})", s.start(), s.end(), report::size(s.len())));
+                    if ui.button("Use in Configuration").on_hover_text("Replaces the ranges in the Configuration tab; review and Apply there.").clicked() {
+                        self.editor.rows = vec![RangeRow { start: format!("{:#x}", s.start()), end: format!("{:#x}", s.end()) }];
+                        self.editor.source = "suggested by memory test (not applied yet)".into();
+                        self.tab = Tab::Config;
+                    }
+                });
+                if !protected.iter().any(|p| p.start() <= s.start() && s.end() <= p.end()) {
+                    ui.colored_label(level_color(Level::Warn), "⚠ The configured bad range does not cover all errors plus margin.");
+                }
+            }
+            egui::CollapsingHeader::new(format!("First {} error(s)", e.samples.len().min(200))).show(ui, |ui| {
+                ui.monospace(format!("{:<16} {:<20} {:<20}", "address", "expected", "actual"));
+                for x in e.samples.iter().take(200) {
+                    ui.monospace(format!("{:<16} {:#018x}   {:#018x}", format!("{:#x}", x.addr), x.expected, x.actual));
+                }
+            });
+        }
+        if !r.untested.is_empty() {
+            egui::CollapsingHeader::new(format!("Untested regions ({})", r.untested.len())).show(ui, |ui| {
+                for u in &r.untested {
+                    ui.monospace(format!("{}  {}", u.range, u.reason));
+                }
+            });
         }
     }
 
@@ -671,6 +950,7 @@ impl eframe::App for ManagerApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Status, "Status");
                 ui.selectable_value(&mut self.tab, Tab::Config, "Configuration");
+                ui.selectable_value(&mut self.tab, Tab::MemTest, "Memory Test");
                 ui.selectable_value(&mut self.tab, Tab::Install, "Install / Uninstall");
             });
             ui.add_space(2.0);
@@ -686,12 +966,55 @@ impl eframe::App for ManagerApp {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                 Tab::Status => self.status_tab(ui),
                 Tab::Config => self.config_tab(ui),
+                Tab::MemTest => self.memtest_tab(ui),
                 Tab::Install => self.install_tab(ui),
             });
         });
 
         self.confirm_dialog(&ctx);
     }
+}
+
+/// Error histogram over the requested span, with tested/untested strips and
+/// the configured bad ranges shaded.
+fn histogram(ui: &mut egui::Ui, r: &badram_core::memtest::TestResult, protected: &[Range]) {
+    let (Some(lo), Some(hi)) = (
+        r.requested.iter().map(Range::start).min(),
+        r.requested.iter().map(Range::end).max(),
+    ) else {
+        return;
+    };
+    let span = (hi - lo).max(1) as f32;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 120.0), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    let x = |a: u64| rect.left() + (a.clamp(lo, hi) - lo) as f32 / span * rect.width();
+    let band = |a: u64, b: u64, y0: f32, y1: f32| {
+        egui::Rect::from_x_y_ranges(x(a)..=x(b).max(x(a) + 1.0), y0..=y1)
+    };
+    let bottom = rect.bottom();
+    for pr in protected {
+        p.rect_filled(band(pr.start(), pr.end(), rect.top(), bottom - 8.0), 0.0, Color32::from_rgba_unmultiplied(0x3a, 0x7b, 0xd5, 50));
+    }
+    for t in &r.tested {
+        p.rect_filled(band(t.start(), t.end(), bottom - 6.0, bottom), 0.0, level_color(Level::Good));
+    }
+    for u in &r.untested {
+        p.rect_filled(band(u.range.start(), u.range.end(), bottom - 6.0, bottom), 0.0, Color32::GRAY);
+    }
+    let max = r.errors.buckets.values().copied().max().unwrap_or(0).max(1) as f32;
+    let usable = rect.height() - 12.0;
+    for (&b, &n) in &r.errors.buckets {
+        let h = (n as f32).sqrt() / max.sqrt() * usable;
+        let end = b + badram_core::memtest::BUCKET_SIZE;
+        p.rect_filled(band(b, end, bottom - 8.0 - h, bottom - 8.0), 0.0, level_color(Level::Bad));
+    }
+    ui.horizontal(|ui| {
+        ui.monospace(format!("{lo:#x}"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.monospace(format!("{hi:#x}"));
+        });
+    });
 }
 
 /// Adds Windows fonts as fallbacks: Segoe UI Symbol for the status icons

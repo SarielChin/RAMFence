@@ -92,6 +92,12 @@ fn read_char() -> Option<char> {
     }
 }
 
+/// Non-blocking: true if Esc was pressed since the last check.
+pub fn escape_pressed() -> bool {
+    use uefi::proto::console::text::ScanCode;
+    matches!(read_key(), Some(Key::Special(ScanCode::ESCAPE)))
+}
+
 /// Discards keys pressed before a prompt was shown.
 fn drain_keys() {
     while read_key().is_some() {}

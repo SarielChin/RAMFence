@@ -13,9 +13,9 @@ use crate::console::Log;
 
 /// When a piece cannot be allocated in one call, retry in chunks of this many
 /// pages (64 MiB), then page by page within a failing chunk.
-const CHUNK_PAGES: u64 = 16 * 1024;
+pub const CHUNK_PAGES: u64 = 16 * 1024;
 
-fn read_map() -> uefi::Result<Vec<MemDesc>> {
+pub fn read_map() -> uefi::Result<Vec<MemDesc>> {
     let map = boot::memory_map(MemoryType::LOADER_DATA)?;
     Ok(map
         .entries()

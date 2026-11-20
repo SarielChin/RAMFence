@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use badram_core::{Config, Range, config, range};
+use badram_core::{Config, Range, config, memtest, range};
 
 use crate::paths::{self, CFG_NAME, EFI_NAME, ENTRY_DESCRIPTION, ESP_DIR, ESP_EFI_PATH, EXE_NAME};
 use crate::state::{self, State};
@@ -251,6 +251,92 @@ pub fn remove_memory_limit(log: Log) -> Result<(), String> {
     Ok(())
 }
 
+/// What is on the ESP regarding the pre-boot memory test.
+#[derive(Clone, Debug)]
+pub struct TestFiles {
+    /// The installed badram.efi can run memory tests (0.2.0 or later).
+    pub efi_supports_test: bool,
+    /// `test.req` exists: a test runs on the next boot.
+    pub pending: bool,
+    /// Last `test-result.txt`, parsed.
+    pub result: Option<Result<memtest::TestResult, String>>,
+}
+
+pub fn read_test_files() -> Result<TestFiles, String> {
+    require_admin()?;
+    esp::with_esp(|root| {
+        let dir = root.join(ESP_DIR);
+        let result = match fs::read_to_string(dir.join(memtest::RESULT_FILE)) {
+            Ok(t) => Some(memtest::parse_result(&t).ok_or_else(|| "test-result.txt is not a valid result".to_string())),
+            Err(_) => None,
+        };
+        Ok(TestFiles {
+            efi_supports_test: efi_supports_test(&dir.join(EFI_NAME)),
+            pending: dir.join(memtest::REQUEST_FILE).is_file(),
+            result,
+        })
+    })
+}
+
+/// badram.efi 0.2.0+ embeds this marker (see FEATURES in badram-efi).
+const MEMTEST_MARKER: &[u8] = b"BADRAM-FEATURES: memtest1";
+
+fn efi_supports_test(efi: &Path) -> bool {
+    fs::read(efi).is_ok_and(|b| contains(&b, MEMTEST_MARKER))
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Writes `test.req` (and removes an old result) so badram.efi runs the
+/// test once on the next boot.
+pub fn schedule_test(request_text: &str, log: Log) -> Result<(), String> {
+    require_admin()?;
+    if state::load().is_none() {
+        return Err("BadRAM is not installed".into());
+    }
+    let req = memtest::parse_request(request_text).map_err(|e| e.to_string())?;
+    esp::with_esp(|root| {
+        let dir = root.join(ESP_DIR);
+        if !efi_supports_test(&dir.join(EFI_NAME)) {
+            return Err("the installed badram.efi is too old to run memory tests; \
+                        update the installation first (Install tab)"
+                .into());
+        }
+        let old = dir.join(memtest::RESULT_FILE);
+        if old.exists() {
+            fs::remove_file(&old).map_err(|e| format!("cannot delete old result: {e}"))?;
+        }
+        write(&dir.join(memtest::REQUEST_FILE), &req.to_text())
+    })?;
+    let bytes: u64 = req.ranges.iter().map(Range::len).sum();
+    log(format!(
+        "Memory test scheduled: {} MiB, {} pass(es). It runs once on the next boot (Esc aborts it).",
+        bytes >> 20,
+        req.passes
+    ));
+    Ok(())
+}
+
+pub fn cancel_test(log: Log) -> Result<(), String> {
+    require_admin()?;
+    esp::with_esp(|root| {
+        let p = root.join(ESP_DIR).join(memtest::REQUEST_FILE);
+        if p.exists() {
+            fs::remove_file(&p).map_err(|e| format!("cannot delete {}: {e}", p.display()))?;
+        }
+        Ok(())
+    })?;
+    log("Scheduled memory test cancelled".into());
+    Ok(())
+}
+
+pub fn restart_now(log: Log) -> Result<(), String> {
+    log("Restarting…".into());
+    win::run_ok("shutdown.exe", &["/r", "/t", "0"]).map(drop)
+}
+
 fn append_check_log(line: &str) {
     use std::io::Write;
     let line = format!("{}  {line}\r\n", win::local_timestamp());
@@ -357,6 +443,17 @@ mod tests {
         assert_eq!(ranges, vec![Range::new(0x1000, 0x6000).unwrap()]);
         assert!(validate_config("range 0x2000 0x1000").is_err());
         assert!(validate_config("").is_err());
+    }
+
+    #[test]
+    fn built_efi_has_memtest_marker() {
+        // Skipped when the UEFI target has not been built.
+        let efi = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/x86_64-unknown-uefi/release/badram.efi");
+        if let Ok(bytes) = fs::read(&efi) {
+            assert!(contains(&bytes, MEMTEST_MARKER), "{} lacks the marker", efi.display());
+        }
+        assert!(!contains(b"BADRAM-FEATURES: memtest", MEMTEST_MARKER));
     }
 
     #[test]

@@ -22,7 +22,7 @@
 #>
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('ok', 'reserved', 'missing-config', 'parse-error', 'conflict', 'halt')]
+    [ValidateSet('ok', 'reserved', 'missing-config', 'parse-error', 'conflict', 'halt', 'memtest')]
     [string]$Case,
 
     # "0xSTART 0xEND" for the conflict/halt cases: pick a BS_Data region
@@ -78,6 +78,14 @@ $Cases = @{
         Cfg  = "range $ConflictRange`non_error boot`ntimeout 0`nchainload $Missing`n"
         Keys = @()
     }
+    'memtest'        = @{
+        # Scheduled pre-boot memory test: the configured range plus 64 MiB
+        # margins, and a low region that includes firmware BootServicesData
+        # (must be reported as untested). The reservation must be unaffected.
+        Cfg     = "$TestRanges`non_error boot`ntimeout 0`nchainload $Missing`n"
+        TestReq = "scan 0x3C000000 0x4C000000`nscan 0x800000 0x1800000`npasses 1`n"
+        Keys    = @()
+    }
     'halt'           = @{
         Cfg  = "range $ConflictRange`non_error halt`ntimeout 0`nchainload $Missing`n"
         # B must be ignored under halt; S powers off.
@@ -120,6 +128,7 @@ function Write-Ascii([string]$Path, [string]$Text) {
 
 Copy-Item $Efi (Join-Path $Esp 'EFI\badram\badram.efi')
 if ($null -ne $Spec.Cfg) { Write-Ascii (Join-Path $Esp 'EFI\badram\badram.cfg') $Spec.Cfg }
+if ($Spec.ContainsKey('TestReq')) { Write-Ascii (Join-Path $Esp 'EFI\badram\test.req') $Spec.TestReq }
 if ($Spec.Stage2) {
     New-Item -ItemType Directory -Force (Join-Path $Esp 'EFI\stage2') | Out-Null
     Copy-Item $Efi (Join-Path $Esp 'EFI\stage2\badram.efi')
@@ -133,6 +142,9 @@ echo "=== memmap ==="
 memmap
 echo "=== BadRamStatus ==="
 dmpstore BadRamStatus -guid $VendorGuid
+echo "=== files ==="
+ls \EFI\badram
+type \EFI\badram\test-result.txt
 echo "=== end ==="
 reset -s
 "@
