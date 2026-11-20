@@ -78,16 +78,25 @@ fn own_image_range() -> Option<Range> {
     Range::new(base, base.checked_add(size)?).ok()
 }
 
-/// Reserves `ranges` (normalized) and verifies. Returns pages reserved.
-/// Every problem is reported through `log.error`.
-pub fn run(ranges: &[Range], cfg_type: CfgMemoryType, log: &mut Log) -> u64 {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Outcome {
+    /// Pages allocated by this run.
+    pub reserved_now: u64,
+    /// Pages inside the ranges that the OS cannot use after this run
+    /// (allocated now, by an earlier run, or never usable RAM in the map).
+    pub protected: u64,
+}
+
+/// Reserves `ranges` (normalized) and verifies. Every problem is reported
+/// through `log.error`.
+pub fn run(ranges: &[Range], cfg_type: CfgMemoryType, log: &mut Log) -> Outcome {
     let mt = MemoryType(cfg_type.efi_type());
 
     let map = match read_map() {
         Ok(m) => m,
         Err(e) => {
             log.error(format_args!("GetMemoryMap failed: {:?}", e.status()));
-            return 0;
+            return Outcome::default();
         }
     };
     let plan = memmap::plan(ranges, &map);
@@ -134,8 +143,14 @@ pub fn run(ranges: &[Range], cfg_type: CfgMemoryType, log: &mut Log) -> u64 {
         plan.conflicts.iter().map(|c| &c.range).chain(failed.iter())
             .any(|k| k.start() <= r.start() && r.end() <= k.end())
     };
+    let mut protected = 0;
     match read_map() {
         Ok(after) => {
+            protected = memmap::segments(ranges, &after)
+                .iter()
+                .filter(|s| memmap::classify(s.ty) == memmap::Class::Unavailable)
+                .map(|s| s.range.pages())
+                .sum();
             for s in memmap::verify(ranges, &after) {
                 if !reported(&s.range) {
                     log.error(format_args!(
@@ -152,5 +167,8 @@ pub fn run(ranges: &[Range], cfg_type: CfgMemoryType, log: &mut Log) -> u64 {
         )),
     }
 
-    reserved
+    Outcome {
+        reserved_now: reserved,
+        protected,
+    }
 }

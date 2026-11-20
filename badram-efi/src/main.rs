@@ -63,7 +63,7 @@ fn main() -> Status {
         .unwrap_or_else(|| DEFAULT_CHAINLOAD.to_string());
 
     let mut ranges: Vec<Range> = Vec::new();
-    let mut reserved_pages = 0;
+    let mut outcome = reserve::Outcome::default();
     if let Some(cfg) = &config {
         match range::normalize(&cfg.ranges) {
             Ok(r) => ranges = r,
@@ -71,12 +71,12 @@ fn main() -> Status {
         }
         for r in &ranges {
             log.info(format_args!(
-                "Range {r} ({} MiB) as {}",
-                r.len() / (1024 * 1024),
+                "Range {r} ({}) as {}",
+                Size(r.len()),
                 mem_type.name()
             ));
         }
-        reserved_pages = reserve::run(&ranges, mem_type, &mut log);
+        outcome = reserve::run(&ranges, mem_type, &mut log);
     }
 
     // Written before any prompt so Windows can tell what happened even if
@@ -84,7 +84,7 @@ fn main() -> Status {
     let status_text = status::format_status(
         log.is_ok(),
         &ranges,
-        reserved_pages,
+        outcome.protected,
         mem_type,
         log.first_error(),
     );
@@ -94,19 +94,17 @@ fn main() -> Status {
 
     let total = range::total_pages(&ranges);
     log.info("");
+    let summary = format!(
+        "{} of {} pages protected ({}); {} newly reserved by this run.",
+        outcome.protected,
+        total,
+        Size(outcome.protected * PAGE_SIZE),
+        outcome.reserved_now
+    );
     if log.is_ok() {
-        log.good(format_args!(
-            "OK: {} of {} pages reserved by this run ({} MiB), {} warning(s).",
-            reserved_pages,
-            total,
-            reserved_pages * PAGE_SIZE / (1024 * 1024),
-            log.warnings()
-        ));
+        log.good(format_args!("OK: {summary} {} warning(s).", log.warnings()));
     } else {
-        log.info(format_args!(
-            "{} of {} pages reserved by this run.",
-            reserved_pages, total
-        ));
+        log.info(summary);
     }
 
     let decision = if log.is_ok() {
@@ -130,6 +128,20 @@ fn main() -> Status {
         Some(Decision::Shutdown) => runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None),
         Some(_) => runtime::reset(ResetType::COLD, Status::SUCCESS, None),
         None => Status::LOAD_ERROR,
+    }
+}
+
+/// Byte count shown as MiB, or KiB when under 1 MiB.
+struct Size(u64);
+
+impl core::fmt::Display for Size {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        const MIB: u64 = 1024 * 1024;
+        if self.0 >= MIB {
+            write!(f, "{} MiB", self.0 / MIB)
+        } else {
+            write!(f, "{} KiB", self.0 / 1024)
+        }
     }
 }
 
@@ -180,7 +192,10 @@ fn load_config() -> Result<Config, String> {
         .map_err(|e| format!("cannot open badram.efi's volume: {:?}", e.status()))?;
     let bytes = FileSystem::new(sfs)
         .read(&*path16)
-        .map_err(|e| format!("cannot read {path}: {e:?}"))?;
+        .map_err(|e| match e {
+            uefi::fs::Error::Io(io) => format!("cannot read {path}: {:?}", io.uefi_error.status()),
+            other => format!("cannot read {path}: {other}"),
+        })?;
     let text = core::str::from_utf8(&bytes).map_err(|_| format!("{path} is not valid UTF-8"))?;
     config::parse(text).map_err(|e| e.to_string())
 }
