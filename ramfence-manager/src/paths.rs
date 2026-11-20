@@ -21,8 +21,13 @@ pub const CFG_NAME: &str = "ramfence.cfg";
 /// `%ProgramFiles%\RAMFence`: writable only by administrators, which matters
 /// because the logon check runs elevated from here.
 pub fn install_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
-    PathBuf::from(base).join("RAMFence")
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        crate::win::program_files()
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+            .join("RAMFence")
+    })
+    .clone()
 }
 
 pub fn state_file() -> PathBuf {

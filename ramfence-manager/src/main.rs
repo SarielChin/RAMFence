@@ -36,8 +36,29 @@ fn print_status() {
 }
 
 fn main() {
+    win::restrict_dll_search();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
+
+    // Running with administrator rights next to foreign DLLs is unsafe (see
+    // win::dlls_next_to_exe). The logon check runs from the install folder,
+    // which only administrators can write to.
+    if !has("--check") && !has("--status") {
+        let dlls = win::dlls_next_to_exe();
+        if !dlls.is_empty() {
+            win::message_box(
+                "RAMFence Manager",
+                &format!(
+                    "The folder this program was started from also contains DLL files ({}). Windows could \
+                     load them into RAMFence Manager, which runs with administrator rights.\n\n\
+                     Move RAMFence-Manager.exe into a folder of its own and start it from there.",
+                    dlls.join(", ")
+                ),
+                win::Icon::Error,
+            );
+            return;
+        }
+    }
 
     if has("--check") {
         std::process::exit(ops::run_check());

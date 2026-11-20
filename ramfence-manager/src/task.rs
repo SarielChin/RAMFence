@@ -64,8 +64,16 @@ pub fn register(exe: &Path) -> Result<(), String> {
     // schtasks expects UTF-16LE with BOM when the declaration says UTF-16.
     let mut bytes = vec![0xFF, 0xFE];
     bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
-    let tmp = std::env::temp_dir().join("ramfence-task.xml");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write task XML: {e}"))?;
+    // In the install folder, not %TEMP%: only administrators can write
+    // there, so no other program can swap the file before schtasks reads it.
+    let tmp = crate::paths::install_dir().join(format!("task-{}.xml", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes))
+        .map_err(|e| format!("cannot write task XML: {e}"))?;
     let tmp_s = tmp.to_string_lossy().into_owned();
     let result = run_ok("schtasks.exe", &["/Create", "/TN", TASK_NAME, "/XML", &tmp_s, "/F"]);
     let _ = std::fs::remove_file(&tmp);

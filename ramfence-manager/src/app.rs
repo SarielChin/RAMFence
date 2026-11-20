@@ -28,6 +28,7 @@ enum Tab {
 /// Default margin around configured ranges for a scheduled test.
 const DEFAULT_MARGIN_MIB: u64 = 256;
 const MIB: u64 = 1024 * 1024;
+const BITLOCKER_UNKNOWN_CONFIRM: &str = "The system drive is not encrypted, or I have its BitLocker recovery key";
 
 enum JobMsg {
     Line(String),
@@ -139,6 +140,9 @@ pub struct ManagerApp {
     efi: Option<ops::EfiSource>,
     suspend_bitlocker: bool,
     allow_secure_boot: bool,
+    /// Confirmed: the recovery key is at hand although the BitLocker status
+    /// cannot be read.
+    bitlocker_unknown_ok: bool,
     job: Option<Job>,
     log: Vec<(LineKind, String)>,
     confirm: Option<Confirm>,
@@ -160,8 +164,9 @@ struct SetupState {
 struct UsbState {
     disks: Option<Result<Vec<ops::UsbDisk>, String>>,
     rx: Option<Receiver<Result<Vec<ops::UsbDisk>, String>>>,
-    /// Selected disk (number, size) — the size guards against renumbering.
-    selected: Option<(u32, u64)>,
+    /// Selected disk (number, identity): the identity guards against
+    /// renumbering and against another drive of the same model.
+    selected: Option<(u32, String)>,
     erase_ok: bool,
 }
 
@@ -249,6 +254,7 @@ impl ManagerApp {
             efi: ops::EfiSource::default_source(),
             suspend_bitlocker: false,
             allow_secure_boot: false,
+            bitlocker_unknown_ok: false,
             job: None,
             log: Vec::new(),
             confirm: None,
@@ -261,8 +267,10 @@ impl ManagerApp {
         app
     }
 
+    /// A job runs, or the test files are being read from the ESP: both mount
+    /// the ESP, so they must not overlap.
     fn busy(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.mt.rx.is_some()
     }
 
     fn refresh(&mut self, ctx: &egui::Context) {
@@ -357,7 +365,7 @@ impl ManagerApp {
     }
 
     fn load_test_files(&mut self, ctx: &egui::Context) {
-        if self.mt.rx.is_some() {
+        if self.mt.rx.is_some() || self.job.is_some() {
             return;
         }
         self.mt.loaded_once = true;
@@ -636,13 +644,16 @@ impl ManagerApp {
         } else {
             (Level::Good, "Secure Boot", "Off".into())
         });
+        let bl_unknown = s.bitlocker.is_none();
         checks.push(if bl_on {
             (if self.suspend_bitlocker { Level::Warn } else { Level::Bad }, "BitLocker", "On: back up the recovery key, then allow suspending it".into())
+        } else if bl_unknown {
+            (if self.bitlocker_unknown_ok { Level::Warn } else { Level::Bad }, "BitLocker", "unknown: confirm below that you have the recovery key".into())
         } else {
-            (Level::Good, "BitLocker", s.bitlocker.clone().unwrap_or_else(|| "unknown".into()))
+            (Level::Good, "BitLocker", s.bitlocker.clone().unwrap_or_default())
         });
         if s.fast_startup == Some(true) {
-            checks.push((Level::Warn, "Fast Startup", "On: consider \"powercfg /h off\"".into()));
+            checks.push((Level::Warn, "Fast Startup", "On: consider turning it off (powercfg /h off, also turns off hibernation)".into()));
         }
         egui::Grid::new("preflight").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
             for (l, label, text) in &checks {
@@ -658,13 +669,17 @@ impl ManagerApp {
         if bl_on {
             ui.checkbox(&mut self.suspend_bitlocker, "Suspend BitLocker for 2 reboots (I have backed up the recovery key)");
         }
+        if bl_unknown {
+            ui.checkbox(&mut self.bitlocker_unknown_ok, BITLOCKER_UNKNOWN_CONFIRM);
+        }
         if sb_on {
             ui.checkbox(&mut self.allow_secure_boot, "Allow Secure Boot (I enrolled this ramfence.efi's hash in db)");
         }
         ui.add_space(8.0);
 
         let blocked = !s.elevated || s.uefi == Some(false) || built.is_err() || !efi_ok
-            || (sb_on && !self.allow_secure_boot) || (bl_on && !self.suspend_bitlocker);
+            || (sb_on && !self.allow_secure_boot) || (bl_on && !self.suspend_bitlocker)
+            || (bl_unknown && !self.bitlocker_unknown_ok);
         let label = if s.installed() { "Update installation…" } else { "Install…" };
         if ui.add_enabled(!blocked && !self.busy(), egui::Button::new(RichText::new(label).strong())).clicked() {
             self.confirm = Some(Confirm::Install);
@@ -762,6 +777,7 @@ impl ManagerApp {
                     efi,
                     suspend_bitlocker: self.suspend_bitlocker,
                     allow_secure_boot: self.allow_secure_boot,
+                    bitlocker_unknown_ok: self.bitlocker_unknown_ok,
                 };
                 self.start_job(ctx, "Install", move |log| ops::install(&opts, log));
             }
@@ -1026,9 +1042,9 @@ impl ManagerApp {
     // -------------------------------------------------------------- USB tool
 
     fn selected_usb_disk(&self) -> Option<ops::UsbDisk> {
-        let (n, size) = self.usb.selected?;
+        let (n, id) = self.usb.selected.as_ref()?;
         let disks = self.usb.disks.as_ref()?.as_ref().ok()?;
-        disks.iter().find(|d| d.number == n && d.size == size && d.erasable()).cloned()
+        disks.iter().find(|d| d.number == *n && d.identity() == *id && d.erasable()).cloned()
     }
 
     fn refresh_usb(&mut self, ctx: &egui::Context) {
@@ -1058,7 +1074,9 @@ impl ManagerApp {
         ui.add_space(6.0);
         ui.label(RichText::new(
             "The PC that uses the stick needs Secure Boot turned off, and you open its boot menu \
-             (often F12, F11, F8, Esc or F10 at the maker's logo) to start from the stick.").weak());
+             (often F12, F11, F8, Esc or F10 at the maker's logo) to start from the stick. If that PC \
+             uses BitLocker or device encryption, have its recovery key ready: starting from the stick \
+             can make Windows ask for it.").weak());
         ui.add_space(10.0);
 
         ui.horizontal(|ui| {
@@ -1082,7 +1100,7 @@ impl ManagerApp {
                 for d in disks.clone() {
                     let text = format!("Disk {}: {}  ({})", d.number, d.friendly_name, report::size(d.size));
                     if d.erasable() {
-                        ui.radio_value(&mut self.usb.selected, Some((d.number, d.size)), text);
+                        ui.radio_value(&mut self.usb.selected, Some((d.number, d.identity())), text);
                     } else {
                         ui.add_enabled(false, egui::RadioButton::new(false, format!("{text}  (Windows starts from this disk)")));
                     }
@@ -1138,7 +1156,14 @@ impl ManagerApp {
         // ---- Step 1: prepare
         let bl_on = s.bitlocker.as_deref() == Some("On");
         let sb_on = s.secure_boot == Some(true);
-        let prepared = s.elevated && s.uefi == Some(true) && !sb_on && !bl_on && s.fast_startup != Some(true);
+        let bl_unknown = s.bitlocker.is_none();
+        let bl_unknown_ok = self.bitlocker_unknown_ok;
+        let prepared = s.elevated
+            && s.uefi == Some(true)
+            && !sb_on
+            && !bl_on
+            && (!bl_unknown || bl_unknown_ok)
+            && s.fast_startup != Some(true);
         step_header(ui, 1, "Prepare this PC", prepared);
         ui.indent("step1", |ui| {
             if !s.elevated {
@@ -1186,11 +1211,16 @@ impl ManagerApp {
                 if ui.add_enabled(self.setup.key_saved && !busy, egui::Button::new("Pause BitLocker for the next 2 restarts")).clicked() {
                     self.start_job(ui.ctx(), "Suspend BitLocker", ops::suspend_bitlocker);
                 }
+            } else if bl_unknown {
+                check_line(ui, Level::Warn, "The BitLocker state of the system drive cannot be read.");
+                ui.label(
+                    "If the drive is encrypted (BitLocker or \"device encryption\"), the next steps make \
+                     Windows ask for its 48-digit recovery key at startup. Find the key first (for \
+                     example at aka.ms/myrecoverykey for a Microsoft account).",
+                );
+                ui.checkbox(&mut self.bitlocker_unknown_ok, BITLOCKER_UNKNOWN_CONFIRM);
             } else {
-                check_line(ui, Level::Good, match s.bitlocker.as_deref() {
-                    Some(_) => "BitLocker is off or paused.",
-                    None => "BitLocker is not in use (or its state is unknown).",
-                });
+                check_line(ui, Level::Good, "BitLocker is off or paused.");
             }
 
             if sb_on {
@@ -1214,9 +1244,9 @@ impl ManagerApp {
             }
 
             if s.fast_startup == Some(true) {
-                check_line(ui, Level::Warn, "Fast Startup is on (Windows can then skip RAMFence when starting).");
-                if ui.add_enabled(!busy, egui::Button::new("Turn off Fast Startup")).clicked() {
-                    self.start_job(ui.ctx(), "Turn off Fast Startup", ops::disable_hibernation);
+                check_line(ui, Level::Warn, "Fast Startup is on: at power-on Windows may restore a session that was started without RAMFence.");
+                if ui.add_enabled(!busy, egui::Button::new("Turn off Fast Startup and hibernation")).clicked() {
+                    self.start_job(ui.ctx(), "Turn off Fast Startup and hibernation", ops::disable_hibernation);
                 }
             } else {
                 check_line(ui, Level::Good, "Fast Startup is off.");
@@ -1309,7 +1339,7 @@ impl ManagerApp {
                 let efi = self.efi.clone().unwrap_or(ops::EfiSource::Embedded);
                 let passes = self.setup.passes;
                 self.start_job(ui.ctx(), "Schedule memory scan", move |log| {
-                    ops::start_first_scan(efi, scan, passes, false, log)
+                    ops::start_first_scan(efi, scan, passes, false, bl_unknown_ok, log)
                 });
             }
             if self.efi.is_none() {
@@ -1342,7 +1372,7 @@ impl ManagerApp {
                 } else if resp.clicked() {
                     let ranges = r.clone();
                     let efi = self.efi.clone().unwrap_or(ops::EfiSource::Embedded);
-                    self.start_job(ui.ctx(), "Install RAMFence", move |log| ops::install_ranges(&ranges, efi, log));
+                    self.start_job(ui.ctx(), "Install RAMFence", move |log| ops::install_ranges(&ranges, efi, bl_unknown_ok, log));
                 }
                 return;
             }

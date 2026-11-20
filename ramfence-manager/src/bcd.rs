@@ -96,6 +96,21 @@ pub fn put_windows_boot_manager_first() -> Result<(), String> {
     run_ok(BCDEDIT, &["/set", "{fwbootmgr}", "displayorder", "{bootmgr}", "/addfirst"]).map(drop)
 }
 
+/// Identifiers of the entries in `bcdedit /enum firmware` output whose `path`
+/// is `efi_path` (case-insensitive).
+pub fn parse_entries_with_path(text: &str, efi_path: &str) -> Vec<String> {
+    text.replace("\r\n", "\n")
+        .split("\n\n")
+        .filter(|block| parse_element(block, "path").is_some_and(|p| p.eq_ignore_ascii_case(efi_path)))
+        .filter_map(|block| parse_element(block, "identifier").and_then(|id| find_guids(&id).into_iter().next()))
+        .collect()
+}
+
+/// Firmware boot entries that start `efi_path`.
+pub fn firmware_entries_with_path(efi_path: &str) -> Result<Vec<String>, String> {
+    Ok(parse_entries_with_path(&run_ok(BCDEDIT, &["/enum", "firmware"])?, efi_path))
+}
+
 pub fn export(path: &str) -> Result<(), String> {
     run_ok(BCDEDIT, &["/export", path]).map(drop)
 }
@@ -161,5 +176,34 @@ mod tests {
                  truncatememory          0x100000000\nnx                      OptIn\n";
         assert_eq!(parse_element(t, "truncatememory").as_deref(), Some("0x100000000"));
         assert_eq!(parse_element(t, "badmemorylist"), None);
+    }
+
+    #[test]
+    fn entries_with_path() {
+        let t = [
+            "Firmware Boot Manager",
+            "---------------------",
+            "identifier              {fwbootmgr}",
+            "displayorder            {11111111-2222-3333-4444-555555555555}",
+            "",
+            "Firmware Application (101fffff)",
+            "-------------------------------",
+            "identifier              {11111111-2222-3333-4444-555555555555}",
+            "device                  partition=\\Device\\HarddiskVolume1",
+            "path                    \\EFI\\RAMFence\\ramfence.efi",
+            "description             RAMFence",
+            "",
+            "Windows Boot Manager",
+            "--------------------",
+            "identifier              {bootmgr}",
+            "path                    \\EFI\\Microsoft\\Boot\\bootmgfw.efi",
+            "",
+        ]
+        .join("\r\n");
+        assert_eq!(
+            parse_entries_with_path(&t, r"\EFI\ramfence\ramfence.efi"),
+            vec!["{11111111-2222-3333-4444-555555555555}"]
+        );
+        assert!(parse_entries_with_path(&t, r"\EFI\other.efi").is_empty());
     }
 }

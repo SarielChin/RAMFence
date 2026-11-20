@@ -75,7 +75,7 @@ try {
         $exitCode = 2
         $msg = "This boot did NOT go through ramfence.efi, so bad memory may be in use right now.`n`n" +
             "Possible causes: the boot order was changed (restored now unless noted below), " +
-            "Secure Boot rejected ramfence.efi, or Windows resumed from hibernation.`n`n" +
+            "or Secure Boot rejected ramfence.efi.`n`n" +
             "Save your work and RESTART NOW (a full restart, not shut down + power on with Fast Startup)."
         if ($orderNote) { $msg += "`n`n$orderNote" }
         Write-CheckLog 'NOT PROTECTED: RamFenceStatus variable missing.'

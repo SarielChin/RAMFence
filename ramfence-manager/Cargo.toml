@@ -1,6 +1,6 @@
 [package]
 name = "ramfence-manager"
-version = "0.5.1"
+version = "0.5.2"
 edition.workspace = true
 license.workspace = true
 description = "Windows GUI to install, configure, check and uninstall ramfence.efi."
@@ -18,4 +18,4 @@ winit = "0.30"
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Globalization", "Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Globalization", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Com"] }

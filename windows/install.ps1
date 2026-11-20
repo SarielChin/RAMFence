@@ -96,7 +96,7 @@ then rerun with -SuspendBitLocker.
 
 $hiberboot = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name HiberbootEnabled -ErrorAction SilentlyContinue).HiberbootEnabled
 if ($hiberboot -eq 1) {
-    Write-Warning 'Fast Startup is on. A resume from hibernation skips ramfence.efi; consider "powercfg /h off".'
+    Write-Warning 'Fast Startup is on. Windows may restore a session that was started without ramfence.efi; consider "powercfg /h off" (also turns off hibernation).'
 }
 
 # --- install -----------------------------------------------------------------

@@ -100,6 +100,9 @@ pub struct InstallOptions {
     pub efi: EfiSource,
     pub suspend_bitlocker: bool,
     pub allow_secure_boot: bool,
+    /// The user confirmed the recovery key is at hand although the BitLocker
+    /// status cannot be read.
+    pub bitlocker_unknown_ok: bool,
 }
 
 pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
@@ -130,10 +133,20 @@ pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
                 .into());
         }
         suspend_bitlocker(log)?;
+    } else if status.bitlocker.is_none() {
+        // Unknown is not "off": the drive may still be encrypted.
+        if !o.bitlocker_unknown_ok {
+            return Err("The BitLocker status of the system drive cannot be read. If the drive is \
+                        encrypted (BitLocker or device encryption), Windows asks for the recovery key \
+                        after this change. Make sure you have the key (or that the drive is not \
+                        encrypted), then confirm it and try again."
+                .into());
+        }
+        log("Warning: BitLocker status unknown; confirmed that the recovery key is at hand.".into());
     }
     if status.fast_startup == Some(true) {
-        log("Warning: Fast Startup is on; a resume from hibernation skips ramfence.efi \
-             (consider \"powercfg /h off\")."
+        log("Warning: Fast Startup is on; Windows may restore a session that was started \
+             without ramfence.efi (consider \"powercfg /h off\", which also turns off hibernation)."
             .into());
     }
 
@@ -192,13 +205,34 @@ pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
 
 pub fn uninstall(log: Log) -> Result<(), String> {
     require_admin()?;
-    match state::load() {
-        Some(s) if bcd::entry_exists(&s.entry_id) => {
-            bcd::put_windows_boot_manager_first()?;
-            bcd::delete_entry(&s.entry_id)?;
-            log(format!("Windows Boot Manager first again; deleted entry {}", s.entry_id));
+    // Windows Boot Manager first in every case, before ramfence.efi is
+    // deleted from the ESP: a first entry pointing to a missing file would
+    // leave the next start to the firmware's fallback behaviour.
+    bcd::put_windows_boot_manager_first()?;
+    log("Windows Boot Manager is first in the firmware boot order".into());
+    let mut ids: Vec<String> = state::load()
+        .map(|s| s.entry_id)
+        .into_iter()
+        .filter(|id| bcd::entry_exists(id))
+        .collect();
+    // Entries the state file does not know about (state.json lost, or an
+    // older install): find them by the file they start.
+    match bcd::firmware_entries_with_path(ESP_EFI_PATH) {
+        Ok(found) => {
+            for id in found {
+                if !ids.iter().any(|x| x.eq_ignore_ascii_case(&id)) {
+                    ids.push(id);
+                }
+            }
         }
-        _ => log("No recorded RAMFence boot entry (already removed?)".into()),
+        Err(e) => log(format!("Warning: cannot list firmware boot entries: {e}")),
+    }
+    if ids.is_empty() {
+        log("No RAMFence boot entry found (already removed?)".into());
+    }
+    for id in ids {
+        bcd::delete_entry(&id)?;
+        log(format!("Deleted boot entry {id}"));
     }
     esp::with_esp(|root| {
         let d = root.join(ESP_DIR);
@@ -238,8 +272,12 @@ pub fn apply_config(text: &str, log: Log) -> Result<(), String> {
     }
     let (cfg, ranges) = validate_config(text)?;
     let cfg_text = config_file_text(&cfg);
-    write(&paths::installed_cfg(), &cfg_text)?;
+    // ESP first: that copy is what takes effect. If it fails, the installed
+    // copy (which the app shows) still matches it.
     esp::with_esp(|root| write(&root.join(ESP_DIR).join(CFG_NAME), &cfg_text))?;
+    write(&paths::installed_cfg(), &cfg_text).map_err(|e| {
+        format!("{e}. The new configuration is on the ESP and takes effect, but the copy in the install folder is old.")
+    })?;
     log(format!(
         "Config applied ({} pages). It takes effect on the next boot.",
         range::total_pages(&ranges)
@@ -440,7 +478,14 @@ pub fn full_scan_range(windows: &[Range], protected: &[Range], installed_bytes: 
 
 /// First-time setup, step "find bad memory": installs in scan-only mode if
 /// RAMFence is not installed yet, then schedules a scan of `scan`.
-pub fn start_first_scan(efi: EfiSource, scan: Range, passes: u32, allow_secure_boot: bool, log: Log) -> Result<(), String> {
+pub fn start_first_scan(
+    efi: EfiSource,
+    scan: Range,
+    passes: u32,
+    allow_secure_boot: bool,
+    bitlocker_unknown_ok: bool,
+    log: Log,
+) -> Result<(), String> {
     if state::load().is_none() {
         install(
             &InstallOptions {
@@ -448,6 +493,7 @@ pub fn start_first_scan(efi: EfiSource, scan: Range, passes: u32, allow_secure_b
                 efi,
                 suspend_bitlocker: false,
                 allow_secure_boot,
+                bitlocker_unknown_ok,
             },
             log,
         )?;
@@ -467,6 +513,11 @@ pub struct UsbDisk {
     pub size: u64,
     pub is_boot: bool,
     pub is_system: bool,
+    /// Device-specific id (`Get-Disk` UniqueId); may be missing.
+    #[serde(default)]
+    pub unique_id: Option<String>,
+    #[serde(default)]
+    pub serial_number: Option<String>,
 }
 
 impl UsbDisk {
@@ -474,6 +525,33 @@ impl UsbDisk {
     pub fn erasable(&self) -> bool {
         !self.is_boot && !self.is_system
     }
+
+    /// Identifies this physical drive, so that a different drive that got
+    /// the same disk number (two sticks of the same model swapped, say) is
+    /// not mistaken for it.
+    pub fn identity(&self) -> String {
+        let t = |s: &Option<String>| s.as_deref().unwrap_or("").trim().to_string();
+        format!("{}|{}|{}|{}", self.size, self.friendly_name.trim(), t(&self.unique_id), t(&self.serial_number))
+    }
+}
+
+/// Standard base64, used to pass arbitrary strings (disk ids) into a
+/// PowerShell script without quoting issues.
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(T[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 pub fn parse_usb_disks(json: &str) -> Result<Vec<UsbDisk>, String> {
@@ -492,7 +570,7 @@ pub fn list_usb_disks() -> Result<Vec<UsbDisk>, String> {
             "-NonInteractive",
             "-Command",
             "ConvertTo-Json -Compress -InputObject @(Get-Disk | Where-Object { $_.BusType -eq 'USB' } | \
-             Select-Object Number, FriendlyName, @{n='Size';e={[uint64]$_.Size}}, IsBoot, IsSystem)",
+             Select-Object Number, FriendlyName, @{n='Size';e={[uint64]$_.Size}}, IsBoot, IsSystem, UniqueId, SerialNumber)",
         ],
     )?;
     parse_usb_disks(&out)
@@ -513,13 +591,17 @@ RAMFence rescue USB
 This stick protects a PC with damaged memory (RAM), even when Windows
 cannot start normally.
 
-1. Secure Boot must be off in the PC's firmware settings (BIOS).
+1. Secure Boot must be off in the PC's firmware settings (BIOS). If the PC
+   uses BitLocker or device encryption, have the recovery key ready
+   (aka.ms/myrecoverykey): starting from this stick can make Windows ask
+   for it.
 2. Plug in the stick, switch the PC on and open the boot menu (often F12,
    F11, F8, Esc or F10 while the maker's logo shows). Choose the USB stick
    (the entry marked UEFI).
 3. First start: RAMFence tests all memory (a few minutes; Esc stops it),
    saves the result on this stick, reserves the damaged areas, then starts
-   Windows. Later starts from this stick skip the test.
+   Windows. Later starts on the same PC skip the test (another PC, or
+   changed memory or firmware, is tested again).
 4. In Windows, run RAMFence-Manager.exe from this stick (as administrator)
    and follow the Setup tab to install RAMFence on the PC. After that the
    stick is no longer needed.
@@ -538,12 +620,23 @@ pub fn create_usb(disk: &UsbDisk, efi: &EfiSource, log: Log) -> Result<(), Strin
     let efi_bytes = efi.load()?;
     let n = disk.number;
     let size = disk.size;
+    let b64 = |s: Option<&str>| base64(s.unwrap_or("").trim().as_bytes());
+    let (name, uid, serial) = (
+        b64(Some(&disk.friendly_name)),
+        b64(disk.unique_id.as_deref()),
+        b64(disk.serial_number.as_deref()),
+    );
     // Re-checks the disk right before erasing: numbers can change when
-    // drives are plugged in or out.
+    // drives are plugged in or out, so the size, name, unique id and serial
+    // number must all still match the drive that was selected.
     let script = format!(
         "$ErrorActionPreference = 'Stop'
+function Dec([string]$s) {{ [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }}
 $d = Get-Disk -Number {n}
-if ($d.BusType -ne 'USB' -or [uint64]$d.Size -ne {size} -or $d.IsBoot -or $d.IsSystem) {{
+if ($d.BusType -ne 'USB' -or [uint64]$d.Size -ne {size} -or $d.IsBoot -or $d.IsSystem -or
+    \"$($d.FriendlyName)\".Trim() -cne (Dec '{name}') -or
+    \"$($d.UniqueId)\".Trim() -cne (Dec '{uid}') -or
+    \"$($d.SerialNumber)\".Trim() -cne (Dec '{serial}')) {{
     throw 'Disk {n} is no longer the selected USB drive. Refresh the list and try again.'
 }}
 if ($d.PartitionStyle -ne 'RAW') {{ Clear-Disk -Number {n} -RemoveData -RemoveOEM -Confirm:$false }}
@@ -586,7 +679,7 @@ Write-Output (\"LETTER=\" + $v.DriveLetter)"
 
 /// Installs RAMFence in protect mode with `ranges` and default settings (used
 /// after starting from a rescue USB stick).
-pub fn install_ranges(ranges: &[Range], efi: EfiSource, log: Log) -> Result<(), String> {
+pub fn install_ranges(ranges: &[Range], efi: EfiSource, bitlocker_unknown_ok: bool, log: Log) -> Result<(), String> {
     let cfg = Config {
         mode: ramfence_core::Mode::Protect,
         ranges: ranges.to_vec(),
@@ -596,7 +689,13 @@ pub fn install_ranges(ranges: &[Range], efi: EfiSource, log: Log) -> Result<(), 
         chainload: None,
     };
     install(
-        &InstallOptions { config_text: cfg.to_text(), efi, suspend_bitlocker: false, allow_secure_boot: false },
+        &InstallOptions {
+            config_text: cfg.to_text(),
+            efi,
+            suspend_bitlocker: false,
+            allow_secure_boot: false,
+            bitlocker_unknown_ok,
+        },
         log,
     )
 }
@@ -687,7 +786,7 @@ pub fn run_check() -> i32 {
                 &with_note(
                     "This boot did NOT go through ramfence.efi, so bad memory may be in use right now.\n\n\
                      Possible causes: the boot order was changed (restored now unless noted below), \
-                     Secure Boot rejected ramfence.efi, or Windows resumed from hibernation.\n\n\
+                     or Secure Boot rejected ramfence.efi.\n\n\
                      Save your work and RESTART NOW."
                         .into(),
                 ),
@@ -727,16 +826,35 @@ mod tests {
 
     #[test]
     fn usb_disk_list_parsing() {
-        let json = r#"[{"Number":2,"FriendlyName":"Some USB Stick","Size":30752000000,"IsBoot":false,"IsSystem":false},
-                       {"Number":3,"FriendlyName":"Boot USB","Size":64000000000,"IsBoot":true,"IsSystem":false}]"#;
+        let json = r#"[{"Number":2,"FriendlyName":"Some USB Stick","Size":30752000000,"IsBoot":false,"IsSystem":false,
+                        "UniqueId":"USBSTOR\\DISK&VEN_X&PROD_Y\\AA11&0","SerialNumber":"AA11  "},
+                       {"Number":3,"FriendlyName":"Boot USB","Size":64000000000,"IsBoot":true,"IsSystem":false,
+                        "UniqueId":null,"SerialNumber":null},
+                       {"Number":4,"FriendlyName":"Old","Size":1,"IsBoot":false,"IsSystem":false}]"#;
         let disks = parse_usb_disks(json).unwrap();
-        assert_eq!(disks.len(), 2);
+        assert_eq!(disks.len(), 3);
         assert_eq!(disks[0].number, 2);
         assert!(disks[0].erasable());
         assert!(!disks[1].erasable());
+        assert_eq!(disks[0].serial_number.as_deref(), Some("AA11  "));
+        assert_eq!(disks[2].unique_id, None);
+        // Same model, same size, different stick: different identity.
+        let mut other = disks[0].clone();
+        other.serial_number = Some("BB22".into());
+        assert_ne!(disks[0].identity(), other.identity());
         assert!(parse_usb_disks("").unwrap().is_empty());
         assert!(parse_usb_disks("[]").unwrap().is_empty());
         assert!(parse_usb_disks("not json").is_err());
+    }
+
+    #[test]
+    fn base64_encoding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64("USB'\u{2019}\"".as_bytes()), "VVNCJ+KAmSI=");
     }
 
     #[test]

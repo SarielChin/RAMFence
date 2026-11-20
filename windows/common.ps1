@@ -10,8 +10,9 @@ $script:RamFenceEntryName = 'RAMFence'
 $script:RamFenceEspDir = '\EFI\ramfence'
 $script:RamFenceEfiPath = '\EFI\ramfence\ramfence.efi'
 # Program Files is writable only by administrators, which matters because
-# check.ps1 runs elevated from a scheduled task.
-$script:RamFenceInstallDir = Join-Path $env:ProgramFiles 'RAMFence'
+# check.ps1 runs elevated from a scheduled task. The known folder, not
+# $env:ProgramFiles, which a user-level environment variable could redirect.
+$script:RamFenceInstallDir = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'RAMFence'
 $script:RamFenceStateFile = Join-Path $script:RamFenceInstallDir 'state.json'
 $script:RamFenceLogFile = Join-Path $script:RamFenceInstallDir 'check.log'
 $script:RamFenceCfgFile = Join-Path $script:RamFenceInstallDir 'ramfence.cfg'
@@ -67,6 +68,20 @@ function ConvertFrom-DisplayOrder([string[]]$Lines) {
         if ($rest -match $script:GuidPattern) { $order += $Matches[0].ToLowerInvariant() }
     }
     , $order
+}
+
+# Identifiers of firmware entries (bcdedit /enum firmware) whose path is $EfiPath.
+function Get-FirmwareEntriesWithPath([string]$EfiPath) {
+    $ids = @()
+    $id = $null
+    foreach ($line in (Invoke-Bcdedit /enum firmware)) {
+        if (-not $line.Trim()) { $id = $null; continue }
+        if ($line -match '^identifier\s+(\S+)') { $id = $Matches[1] }
+        if ($line -match '^path\s+(.+)$' -and $Matches[1].Trim() -eq $EfiPath -and $id -match $script:GuidPattern) {
+            $ids += $Matches[0].ToLowerInvariant()
+        }
+    }
+    , $ids
 }
 
 function Test-BcdEntry([string]$Id) {
@@ -151,7 +166,7 @@ public static class RamFenceFirmware {
 
     // data == null with error code on failure.
     public static byte[] Read(string name, string guid, out int error) {
-        byte[] buf = new byte[4096];
+        byte[] buf = new byte[65536];
         uint attrs;
         uint n = GetFirmwareEnvironmentVariableExW(name, guid, buf, (uint)buf.Length, out attrs);
         if (n == 0) { error = Marshal.GetLastWin32Error(); return null; }
@@ -268,40 +283,88 @@ function Save-RamFenceState([string]$Id) {
 
 # --- config validation -----------------------------------------------------------
 
-# Light check mirroring ramfence-core's parser, so obvious mistakes are caught
-# before rebooting. The real parser in ramfence.efi remains authoritative.
+# Mirrors ramfence-core's parser (ramfence-core/src/config.rs) rule for rule,
+# so a file that passes here is also accepted by ramfence.efi at boot: keys
+# and values are case-sensitive, single-value keys may appear once, the file
+# must be UTF-8 (optionally with BOM). ramfence.efi remains authoritative.
 function Test-RamFenceConfig([string]$Path) {
     $errors = @()
+    try {
+        $bytes = [IO.File]::ReadAllBytes((Resolve-Path $Path))
+        # Strict decoder: throws on bytes that are not valid UTF-8 (e.g. a
+        # UTF-16 file saved by Notepad), which ramfence.efi would reject.
+        $text = (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes)
+    } catch {
+        return , @("cannot read the file as UTF-8 text: $($_.Exception.Message)")
+    }
+    # Ordinal check: a culture-aware StartsWith ignores U+FEFF and always matches.
+    if ($text.Length -and [int]$text[0] -eq 0xFEFF) { $text = $text.Substring(1) }
+
     $ranges = 0
     $mode = 'protect'
+    $seen = @{}
     $n = 0
-    foreach ($raw in (Get-Content $Path)) {
+    # Rust's str::lines(): split at \n, drop one trailing \r.
+    foreach ($raw in ($text -split "`n")) {
         $n++
-        $line = ($raw -replace '#.*$', '').Trim()
+        $raw = $raw -replace "`r$", ''
+        $i = $raw.IndexOf('#')
+        $line = $(if ($i -ge 0) { $raw.Substring(0, $i) } else { $raw }).Trim()
         if (-not $line) { continue }
-        $parts = $line -split '\s+'
-        switch ($parts[0]) {
+        $parts = @($line -split '\s+')
+        $key = $parts[0]
+        $argc = $parts.Count - 1
+        if ($key -cin 'mode', 'memory_type', 'on_error', 'timeout', 'chainload') {
+            if ($seen.ContainsKey($key)) { $errors += "line ${n}: '$key' appears more than once"; continue }
+            $seen[$key] = $true
+        }
+        switch -CaseSensitive ($key) {
             'range' {
-                if ($parts.Count -ne 3 -or $parts[1] -notmatch '^0[xX][0-9a-fA-F_]+$' -or $parts[2] -notmatch '^0[xX][0-9a-fA-F_]+$') {
-                    $errors += "line ${n}: expected 'range 0xSTART 0xEND'"
-                } else {
-                    $s = [UInt64]::Parse(($parts[1].Substring(2) -replace '_', ''), 'AllowHexSpecifier')
-                    $e = [UInt64]::Parse(($parts[2].Substring(2) -replace '_', ''), 'AllowHexSpecifier')
-                    if ($s -ge $e) { $errors += "line ${n}: start must be below end" } else { $ranges++ }
-                }
+                if ($argc -ne 2) { $errors += "line ${n}: 'range' takes 2 value(s), got $argc"; break }
+                $s = ConvertFrom-ConfigAddress $parts[1]
+                $e = ConvertFrom-ConfigAddress $parts[2]
+                if ($null -eq $s) { $errors += "line ${n}: invalid address '$($parts[1])'" }
+                elseif ($null -eq $e) { $errors += "line ${n}: invalid address '$($parts[2])'" }
+                elseif ($s -ge $e) { $errors += "line ${n}: start must be below end" }
+                elseif ($e -gt [UInt64]::MaxValue - 4095) { $errors += "line ${n}: range end cannot be page-aligned" }
+                else { $ranges++ }
             }
             'mode' {
-                if ($parts.Count -ne 2 -or $parts[1] -notin 'protect', 'scan-only', 'auto') { $errors += "line ${n}: mode must be protect, scan-only or auto" }
+                if ($argc -ne 1 -or $parts[1] -cnotin 'protect', 'scan-only', 'auto') { $errors += "line ${n}: mode must be protect, scan-only or auto" }
                 else { $mode = $parts[1] }
             }
-            'memory_type' { if ($parts.Count -ne 2 -or $parts[1] -notin 'unusable', 'reserved') { $errors += "line ${n}: memory_type must be unusable or reserved" } }
-            'on_error' { if ($parts.Count -ne 2 -or $parts[1] -notin 'prompt', 'boot', 'halt') { $errors += "line ${n}: on_error must be prompt, boot or halt" } }
-            'timeout' { if ($parts.Count -ne 2 -or $parts[1] -notmatch '^\d+$') { $errors += "line ${n}: timeout must be a number of seconds" } }
-            'chainload' { if (-not $line.Substring(9).Trim().StartsWith('\')) { $errors += "line ${n}: chainload path must start with '\'" } }
-            default { $errors += "line ${n}: unknown key '$($parts[0])'" }
+            'memory_type' { if ($argc -ne 1 -or $parts[1] -cnotin 'unusable', 'reserved') { $errors += "line ${n}: memory_type must be unusable or reserved" } }
+            'on_error' { if ($argc -ne 1 -or $parts[1] -cnotin 'prompt', 'boot', 'halt') { $errors += "line ${n}: on_error must be prompt, boot or halt" } }
+            'timeout' {
+                $t = [UInt32]0
+                if ($argc -ne 1 -or $parts[1] -notmatch '^\+?[0-9]+$' -or
+                    -not [UInt32]::TryParse($parts[1].TrimStart('+'), [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$t)) {
+                    $errors += "line ${n}: timeout must be a number of seconds (0 to 4294967295)"
+                }
+            }
+            'chainload' {
+                $rest = $line.Substring($key.Length).Trim()
+                if (-not $rest) { $errors += "line ${n}: 'chainload' takes 1 value(s), got 0" }
+                elseif (-not $rest.StartsWith('\')) { $errors += "line ${n}: chainload path must start with '\'" }
+            }
+            default { $errors += "line ${n}: unknown key '$key'" }
         }
     }
-    if ($mode -eq 'protect' -and $ranges -eq 0) { $errors += "no 'range' line" }
-    if ($mode -ne 'protect' -and $ranges -gt 0) { $errors += "'range' lines are not allowed with 'mode $mode'" }
+    if ($mode -ceq 'protect' -and $ranges -eq 0) { $errors += "no 'range' line" }
+    if ($mode -cne 'protect' -and $ranges -gt 0) { $errors += "'range' lines are not allowed with 'mode $mode'" }
     , $errors
+}
+
+# 0x-prefixed hex as ramfence.efi parses it ('_' allowed between digits);
+# $null if invalid or larger than 64 bits.
+function ConvertFrom-ConfigAddress([string]$Text) {
+    if ($Text -cnotmatch '^0[xX]([0-9a-fA-F][0-9a-fA-F_]*)$') { return $null }
+    $hex = $Matches[1]
+    if ($hex.EndsWith('_')) { return $null }
+    $digits = ($hex -replace '_', '').TrimStart('0')
+    if (-not $digits) { $digits = '0' }
+    if ($digits.Length -gt 16) { return $null }
+    $v = [UInt64]0
+    if (-not [UInt64]::TryParse($digits, [Globalization.NumberStyles]::AllowHexSpecifier, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)) { return $null }
+    $v
 }

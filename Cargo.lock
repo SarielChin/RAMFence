@@ -2184,7 +2184,7 @@ version = "0.1.0"
 
 [[package]]
 name = "ramfence-efi"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ramfence-core",
  "uefi",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "ramfence-manager"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "eframe",
  "ramfence-core",

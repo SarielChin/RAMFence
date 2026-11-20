@@ -105,7 +105,7 @@ pub fn rows(s: &SystemStatus) -> Vec<Row> {
     });
     let (l, t) = yes_no(
         s.fast_startup,
-        (Level::Warn, "On (a resume from hibernation skips ramfence.efi)"),
+        (Level::Warn, "On (Windows may restore a session started without RAMFence)"),
         (Level::Good, "Off"),
     );
     v.push(row("Fast Startup", l, t));

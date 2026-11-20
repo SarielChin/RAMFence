@@ -19,17 +19,24 @@ $ErrorActionPreference = 'Stop'
 
 if (-not $WhatIfPreference) { Assert-Admin }
 
+# Windows Boot Manager first in every case, before ramfence.efi is deleted
+# from the ESP: a first entry pointing to a missing file would leave the next
+# start to the firmware's fallback behaviour.
+if ($PSCmdlet.ShouldProcess('{fwbootmgr}', 'Put Windows Boot Manager first')) {
+    Invoke-Bcdedit /set '{fwbootmgr}' displayorder '{bootmgr}' /addfirst | Out-Null
+}
+$ids = @()
 $state = Get-RamFenceState
-if ($state -and (Test-BcdEntry $state.EntryId)) {
-    $id = $state.EntryId
-    if ($PSCmdlet.ShouldProcess('{fwbootmgr}', 'Put Windows Boot Manager first')) {
-        Invoke-Bcdedit /set '{fwbootmgr}' displayorder '{bootmgr}' /addfirst | Out-Null
-    }
+if ($state -and (Test-BcdEntry $state.EntryId)) { $ids += $state.EntryId.ToLowerInvariant() }
+# Entries state.json does not know about (file lost, older install).
+foreach ($found in (Get-FirmwareEntriesWithPath $RamFenceEfiPath)) {
+    if ($ids -notcontains $found) { $ids += $found }
+}
+if (-not $ids.Count) { Write-Warning 'No RAMFence boot entry found (already removed?).' }
+foreach ($id in $ids) {
     if ($PSCmdlet.ShouldProcess($id, 'Delete RAMFence firmware boot entry')) {
         Invoke-Bcdedit /delete $id | Out-Null
     }
-} else {
-    Write-Warning "No RAMFence boot entry recorded in $RamFenceStateFile (or it no longer exists)."
 }
 
 if ($PSCmdlet.ShouldProcess("ESP $RamFenceEspDir", 'Delete')) {

@@ -128,7 +128,9 @@ If the PC crashes before or while Windows starts:
 1. On any working Windows PC, open RAMFence Manager → **USB Tool**, choose a USB
    stick (it will be erased) and create the rescue stick.
 2. On the affected PC, turn Secure Boot off, then start from the stick (boot
-   menu, often F12, F11, F8, Esc or F10 at the maker's logo).
+   menu, often F12, F11, F8, Esc or F10 at the maker's logo). If the PC uses
+   BitLocker or device encryption, have its recovery key ready: starting from
+   the stick can make Windows ask for it.
 3. The first start scans all memory and saves the result on the stick; it then
    reserves the damaged areas and starts Windows. Later starts on the same PC
    reuse the result; on another PC, or after a memory or firmware change, the

@@ -28,6 +28,54 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Makes DLLs that are loaded at run time come only from System32, never
+/// from the directory this exe was started from (for example Downloads).
+pub fn restrict_dll_search() {
+    use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories};
+    // SAFETY: plain flag argument.
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
+}
+
+/// DLL files next to this exe. Windows loads some of the exe's imports from
+/// its own directory before any code of ours runs, so a planted DLL there
+/// (say, in Downloads) would run with administrator rights once elevated.
+pub fn dlls_next_to_exe() -> Vec<String> {
+    let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Into::into)) else {
+        return Vec::new();
+    };
+    let dir: std::path::PathBuf = dir;
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.to_ascii_lowercase().ends_with(".dll"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The real "Program Files" folder (known folder, not the `ProgramFiles`
+/// environment variable, which a user-level setting could redirect).
+pub fn program_files() -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+    let mut p: windows_sys::core::PWSTR = ptr::null_mut();
+    // SAFETY: valid GUID pointer and out pointer; the returned buffer is
+    // freed with CoTaskMemFree in every case, as documented.
+    unsafe {
+        let hr = SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, ptr::null_mut(), &mut p);
+        let out = if hr == 0 && !p.is_null() {
+            let len = (0..).take_while(|&i| *p.add(i) != 0).count();
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+            Some(std::path::PathBuf::from(s))
+        } else {
+            None
+        };
+        CoTaskMemFree(p as *const _);
+        out
+    }
+}
 const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 
 /// NUL-terminated UTF-16.
@@ -210,7 +258,7 @@ pub fn read_firmware_variable(name: &str, guid: &str) -> Result<Option<Vec<u8>>,
         format!("cannot enable SeSystemEnvironmentPrivilege (Win32 error {e}); run as administrator")
     })?;
     let (n, g) = (wide(name), wide(guid));
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 64 * 1024];
     let mut attrs = 0u32;
     // SAFETY: buffer and strings valid for the call.
     let len = unsafe {
@@ -311,6 +359,14 @@ pub fn attach_parent_console() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_files_is_the_known_folder() {
+        let p = program_files().expect("known folder");
+        assert!(p.is_absolute() && p.is_dir(), "{}", p.display());
+        // Not taken from the environment variable.
+        assert!(std::env::var_os("ProgramFiles").is_none_or(|v| std::path::Path::new(&v) == p));
+    }
 
     #[test]
     fn wide_is_nul_terminated() {

@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 
-use ramfence_core::memmap::{self, type_name};
+use ramfence_core::memmap::{self, MemDesc, mem_type, type_name};
 use ramfence_core::memtest::{
     self, REQUEST_FILE, RESULT_FILE, TestHost, TestMemory, TestResult, Untested,
 };
@@ -25,6 +25,10 @@ use uefi::{CString16, print, println};
 use crate::console::{self, Log};
 use crate::machine;
 use crate::reserve::{self, CHUNK_PAGES};
+
+/// Free memory below 4 GiB that a test leaves to the firmware.
+const KEEP_FREE_LOW: u64 = 64 << 20;
+const FOUR_GIB: u64 = 1 << 32;
 
 struct Phys {
     base: u64,
@@ -257,10 +261,31 @@ fn run(ranges: &[Range], passes: u32, log: &mut Log) -> TestResult {
         result.untested.push(Untested { range: *u, reason: "not in memory map".into() });
     }
 
+    // Leave some free memory below 4 GiB to the firmware: it keeps
+    // allocating during the test (pool for the error log, timers, drivers),
+    // and an allocation failure there would stop the boot. Chunks are taken
+    // in ascending order, so the ones just below 4 GiB stay free; firmware
+    // allocates top-down from there.
+    let below_4g = Range::new(0, FOUR_GIB).expect("non-empty");
+    let low_free: u64 = map
+        .iter()
+        .filter(|d| d.ty == mem_type::CONVENTIONAL)
+        .filter_map(MemDesc::range)
+        .filter_map(|r| r.intersect(&below_4g))
+        .map(|r| r.len())
+        .sum();
+    let mut low_budget = low_free.saturating_sub(KEEP_FREE_LOW);
+
     // Allocate free memory in chunks as temporary LoaderData.
     let mut chunks: Vec<(NonNull<u8>, usize, Range)> = Vec::new();
     for piece in &plan.allocate {
         for c in piece.chunks(CHUNK_PAGES) {
+            let low = c.intersect(&below_4g).map_or(0, |r| r.len());
+            if low > low_budget {
+                result.untested.push(Untested { range: c, reason: "kept free for the firmware".into() });
+                continue;
+            }
+            low_budget -= low;
             let pages = c.pages() as usize;
             match boot::allocate_pages(AllocateType::Address(c.start()), MemoryType::LOADER_DATA, pages) {
                 Ok(p) => chunks.push((p, pages, c)),
@@ -307,17 +332,22 @@ fn run(ranges: &[Range], passes: u32, log: &mut Log) -> TestResult {
 
 fn summarize(r: &TestResult, log: &mut Log) {
     let e = &r.errors;
-    let state = if r.completed { "completed" } else { "ABORTED" };
-    if e.count == 0 {
-        log.good(format_args!(
-            "Memory test {state}: no errors in {} MiB.",
-            r.tested_bytes() >> 20
-        ));
+    // A stopped test did not finish all of its passes over the memory, so
+    // the amount is only what it was testing.
+    let scope = if r.completed {
+        format!("in {} MiB", r.tested_bytes() >> 20)
     } else {
+        format!("so far (testing {} MiB)", r.tested_bytes() >> 20)
+    };
+    if e.count == 0 && r.completed {
+        log.good(format_args!("Memory test completed: no errors {scope}."));
+    } else if e.count == 0 {
+        log.warn(format_args!("Memory test STOPPED before it finished: no errors {scope}."));
+    } else {
+        let state = if r.completed { "completed" } else { "STOPPED before it finished" };
         log.warn(format_args!(
-            "Memory test {state}: {} error(s) in {} MiB, {:#x} - {:#x}, mask {:#018x}",
+            "Memory test {state}: {} error(s) {scope}, {:#x} - {:#x}, mask {:#018x}",
             e.count,
-            r.tested_bytes() >> 20,
             e.lowest.unwrap_or(0),
             e.highest.unwrap_or(0),
             e.mask
