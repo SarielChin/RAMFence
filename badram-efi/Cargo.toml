@@ -1,0 +1,13 @@
+[package]
+name = "badram-efi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "badram"
+path = "src/main.rs"
+
+[dependencies]
+badram-core = { path = "../badram-core" }
+uefi = { version = "0.41.0", features = ["alloc", "logger", "panic_handler", "global_allocator"] }
