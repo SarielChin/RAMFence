@@ -35,6 +35,26 @@ without the bad ranges, and the size of the bad area does not matter.
 ## How it works
 
 ```
+Mainboard chip        EFI System Partition on the disk                     Windows partition (C:)
+┌──────────────┐      ┌──────────────┐      ┌───────────────────────┐      ┌──────────────────┐
+│   Firmware   │ ───> │ ramfence.efi │ ───> │  Windows Boot Manager │ ───> │  Windows kernel  │
+│  (UEFI/BIOS) │      │              │      │    (bootmgfw.efi)     │      │                  │
+└──────────────┘      └──────────────┘      └───────────────────────┘      └──────────────────┘
+```
+
+- The **firmware** (UEFI, often still called the BIOS) is stored on a chip on
+  the mainboard and runs first. It initializes the memory and builds the
+  memory map: the list of which physical memory is usable.
+- **`ramfence.efi`** and **Windows Boot Manager** are both programs stored as
+  files on the EFI System Partition. The firmware starts whichever comes first
+  in its boot order, and RAMFence is placed first.
+- RAMFence runs after the firmware and before Windows Boot Manager. It asks the
+  firmware to mark the bad ranges as unusable, so Windows Boot Manager and
+  Windows receive a memory map that already excludes them.
+
+What `ramfence.efi` does on every boot:
+
+```
 Firmware ──> ramfence.efi ──────────────────────────> Windows Boot Manager ──> Windows
              1. read ramfence.cfg                       (bootmgfw.efi, unmodified)
              2. AllocatePages(EfiUnusableMemory) on each bad range
