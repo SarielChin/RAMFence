@@ -1,4 +1,4 @@
-//! Parser for `ramfence.cfg` (see DESIGN.md §3).
+//! Parser for `ramfence.cfg`.
 //!
 //! Line-oriented, `#` starts a comment (anywhere on the line). Keys:
 //!
@@ -47,7 +47,7 @@ impl MemoryType {
     }
 }
 
-/// What to do when something goes wrong (DESIGN.md §2.3).
+/// What to do when something goes wrong.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OnError {
     /// Show the error and wait for B (boot) / R (reboot) / S (shutdown).

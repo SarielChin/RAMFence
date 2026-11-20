@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Check that this boot went through ramfence.efi (DESIGN.md section 5.3).
+    Check that this boot went through ramfence.efi.
 
 .DESCRIPTION
     Run as Administrator; install.ps1 registers it as a logon task.

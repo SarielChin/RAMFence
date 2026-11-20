@@ -1,5 +1,5 @@
-//! ramfence.efi ??reserve bad physical memory before Windows boots, then
-//! chainload bootmgfw.efi. See DESIGN.md ?2 for the flow.
+//! ramfence.efi — reserve bad physical memory before Windows boots, then
+//! chainload bootmgfw.efi. See README.md, "How it works", for the flow.
 
 #![no_main]
 #![no_std]
@@ -35,7 +35,7 @@ const DEFAULT_CHAINLOAD: &str = "\\EFI\\Microsoft\\Boot\\bootmgfw.efi";
 /// tell whether this ramfence.efi supports memory tests.
 static FEATURES: [u8; 28] = *b"RAMFENCE-FEATURES: memtest1\0";
 
-/// Vendor GUID of the `RamFenceStatus` variable (DESIGN.md ?2.5).
+/// Vendor GUID of the `RamFenceStatus` variable.
 pub const STATUS_VENDOR: VariableVendor =
     VariableVendor(guid!("0b0c86ee-7039-477b-9a53-e39345ef90d5"));
 

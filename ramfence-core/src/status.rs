@@ -1,4 +1,4 @@
-//! Contents of the volatile `RamFenceStatus` UEFI variable (DESIGN.md §2.5).
+//! Contents of the volatile `RamFenceStatus` UEFI variable.
 //!
 //! Format (ASCII, `;`-separated `key=value`):
 //!

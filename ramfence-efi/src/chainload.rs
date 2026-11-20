@@ -1,4 +1,4 @@
-//! Find and start the next boot stage, normally bootmgfw.efi (DESIGN.md §2.4).
+//! Find and start the next boot stage, normally bootmgfw.efi.
 
 use alloc::boxed::Box;
 use alloc::format;

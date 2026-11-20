@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Run ramfence.efi under QEMU + OVMF (DESIGN.md section 7.2) and capture the
+    Run ramfence.efi under QEMU + OVMF and capture the
     serial console.
 
 .DESCRIPTION

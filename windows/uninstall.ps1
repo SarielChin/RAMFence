@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remove ramfence.efi (DESIGN.md section 5.4).
+    Remove ramfence.efi.
 
 .DESCRIPTION
     Run as Administrator. Puts Windows Boot Manager first, deletes the RAMFence

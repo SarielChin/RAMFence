@@ -1,5 +1,5 @@
 //! Reserve the configured ranges via `AllocatePages(AllocateAddress, ...)`
-//! and verify the result (DESIGN.md §2 steps 2–4).
+//! and verify the result.
 
 use alloc::vec::Vec;
 

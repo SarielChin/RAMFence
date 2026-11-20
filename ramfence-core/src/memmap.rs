@@ -1,4 +1,4 @@
-//! Intersect configured ranges with the UEFI memory map (DESIGN.md §2, §2.2).
+//! Intersect configured ranges with the UEFI memory map.
 //!
 //! The UEFI side converts its memory descriptors into [`MemDesc`] and calls
 //! [`plan`] to learn which pieces to `AllocatePages(AllocateAddress, ...)`,

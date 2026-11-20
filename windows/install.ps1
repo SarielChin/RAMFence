@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Install ramfence.efi as the first firmware boot entry (DESIGN.md section 5.2).
+    Install ramfence.efi as the first firmware boot entry.
 
 .DESCRIPTION
     Run as Administrator. Steps:
@@ -27,7 +27,7 @@
 
 .PARAMETER AllowSecureBoot
     Install even though Secure Boot is on. Only use this after enrolling the
-    hash of this exact ramfence.efi in the firmware's db (DESIGN.md section 6);
+    hash of this exact ramfence.efi in the firmware's db;
     otherwise the firmware silently skips it.
 
 .EXAMPLE
@@ -73,7 +73,7 @@ if ($secureBoot -eq $true -and -not $AllowSecureBoot) {
 Secure Boot is ON. The firmware will refuse the unsigned ramfence.efi and fall
 through to Windows Boot Manager, leaving bad memory unprotected.
 Either turn Secure Boot off, or enroll this ramfence.efi's hash in db and rerun
-with -AllowSecureBoot (DESIGN.md section 6).
+with -AllowSecureBoot.
 '@
 } elseif ($null -eq $secureBoot) {
     Write-Warning 'Could not read the Secure Boot state.'

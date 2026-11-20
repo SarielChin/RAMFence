@@ -156,7 +156,7 @@ fn ask(boot_allowed: bool) -> Decision {
     }
 }
 
-/// Applies `on_error` (DESIGN.md §2.3) after at least one error.
+/// Applies `on_error` after at least one error.
 pub fn handle_error(mode: OnError, timeout: u32, log: &Log) -> Decision {
     println!();
     colored(
