@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["badram-core", "badram-efi"]
+members = ["badram-core", "badram-efi", "badram-manager"]
 
 [workspace.package]
 edition = "2024"

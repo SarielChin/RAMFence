@@ -1,0 +1,718 @@
+//! egui front end. Long operations (status collection, install, ...) run on
+//! a worker thread and stream log lines back; the UI only renders.
+
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
+
+use badram_core::config::parse_address;
+use badram_core::{Config, MemoryType, OnError, PAGE_SIZE, Range, range};
+use eframe::egui::{self, Color32, RichText};
+
+use crate::ops::{self, InstallOptions, Log};
+use crate::paths;
+use crate::report::{self, Level};
+use crate::sysstatus::{self, SystemStatus, Verdict};
+
+const DEFAULT_CHAINLOAD: &str = r"\EFI\Microsoft\Boot\bootmgfw.efi";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Status,
+    Config,
+    Install,
+}
+
+enum JobMsg {
+    Line(String),
+    Done(Result<(), String>),
+}
+
+struct Job {
+    rx: Receiver<JobMsg>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Confirm {
+    Install,
+    Uninstall,
+    ApplyConfig,
+    RemoveLimit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineKind {
+    Header,
+    Normal,
+    Ok,
+    Error,
+}
+
+#[derive(Clone, Default)]
+struct RangeRow {
+    start: String,
+    end: String,
+}
+
+struct Editor {
+    rows: Vec<RangeRow>,
+    memory_type: MemoryType,
+    on_error: OnError,
+    timeout: u32,
+    chainload: String,
+    source: String,
+}
+
+impl Editor {
+    fn new() -> Self {
+        Editor {
+            rows: vec![RangeRow::default()],
+            memory_type: MemoryType::Unusable,
+            on_error: OnError::Prompt,
+            timeout: 3,
+            chainload: String::new(),
+            source: "new".into(),
+        }
+    }
+
+    fn load(&mut self, c: &Config, source: String) {
+        self.rows = c
+            .ranges
+            .iter()
+            .map(|r| RangeRow {
+                start: format!("{:#x}", r.start()),
+                end: format!("{:#x}", r.end()),
+            })
+            .collect();
+        if self.rows.is_empty() {
+            self.rows.push(RangeRow::default());
+        }
+        self.memory_type = c.memory_type;
+        self.on_error = c.on_error;
+        self.timeout = c.timeout_secs;
+        self.chainload = c.chainload.clone().unwrap_or_default();
+        self.source = source;
+    }
+
+    fn row_range(row: &RangeRow) -> Result<Range, String> {
+        let s = parse_address(row.start.trim()).map_err(|_| "start: expected hex like 0x1000".to_string())?;
+        let e = parse_address(row.end.trim()).map_err(|_| "end: expected hex like 0x2000".to_string())?;
+        Range::new(s, e).map_err(|_| "start must be below end".to_string())
+    }
+
+    fn build(&self) -> Result<Config, String> {
+        let mut ranges = Vec::new();
+        for (i, row) in self.rows.iter().enumerate() {
+            ranges.push(Self::row_range(row).map_err(|e| format!("range {}: {e}", i + 1))?);
+        }
+        let chainload = self.chainload.trim();
+        let cfg = Config {
+            ranges,
+            memory_type: self.memory_type,
+            on_error: self.on_error,
+            timeout_secs: self.timeout,
+            chainload: (!chainload.is_empty()).then(|| chainload.to_string()),
+        };
+        // Round-trip through the same parser badram.efi uses.
+        ops::validate_config(&cfg.to_text()).map(|(c, _)| c)
+    }
+}
+
+pub struct ManagerApp {
+    tab: Tab,
+    status: Option<SystemStatus>,
+    status_rx: Option<Receiver<SystemStatus>>,
+    editor: Editor,
+    efi_path: String,
+    suspend_bitlocker: bool,
+    allow_secure_boot: bool,
+    job: Option<Job>,
+    log: Vec<(LineKind, String)>,
+    confirm: Option<Confirm>,
+}
+
+fn level_color(l: Level) -> Color32 {
+    match l {
+        Level::Good => Color32::from_rgb(0x2e, 0xa0, 0x4f),
+        Level::Info => Color32::GRAY,
+        Level::Warn => Color32::from_rgb(0xd0, 0x8a, 0x00),
+        Level::Bad => Color32::from_rgb(0xd6, 0x3a, 0x3a),
+    }
+}
+
+fn level_icon(l: Level) -> &'static str {
+    match l {
+        Level::Good => "✔",
+        Level::Info => "•",
+        Level::Warn => "⚠",
+        Level::Bad => "✖",
+    }
+}
+
+impl ManagerApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        install_cjk_fallback(&cc.egui_ctx);
+        let mut editor = Editor::new();
+        if let Some(Ok(c)) = sysstatus::load_installed_config() {
+            editor.load(&c, format!("installed ({})", paths::installed_cfg().display()));
+        }
+        let mut app = ManagerApp {
+            tab: Tab::Status,
+            status: None,
+            status_rx: None,
+            editor,
+            efi_path: paths::find_efi().map(|p| p.display().to_string()).unwrap_or_default(),
+            suspend_bitlocker: false,
+            allow_secure_boot: false,
+            job: None,
+            log: Vec::new(),
+            confirm: None,
+        };
+        app.refresh(&cc.egui_ctx);
+        app
+    }
+
+    fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    fn refresh(&mut self, ctx: &egui::Context) {
+        if self.status_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(sysstatus::collect());
+            ctx.request_repaint();
+        });
+        self.status_rx = Some(rx);
+    }
+
+    fn start_job<F>(&mut self, ctx: &egui::Context, title: &str, f: F)
+    where
+        F: FnOnce(Log) -> Result<(), String> + Send + 'static,
+    {
+        if self.busy() {
+            return;
+        }
+        self.log.push((LineKind::Header, format!("== {title} ==")));
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let line_tx = tx.clone();
+            let line_ctx = ctx.clone();
+            let mut log = move |s: String| {
+                let _ = line_tx.send(JobMsg::Line(s));
+                line_ctx.request_repaint();
+            };
+            let result = f(&mut log);
+            let _ = tx.send(JobMsg::Done(result));
+            ctx.request_repaint();
+        });
+        self.job = Some(Job { rx });
+    }
+
+    fn poll(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.status_rx
+            && let Ok(s) = rx.try_recv()
+        {
+            self.status = Some(s);
+            self.status_rx = None;
+        }
+        let mut finished = false;
+        if let Some(job) = &self.job {
+            while let Ok(msg) = job.rx.try_recv() {
+                match msg {
+                    JobMsg::Line(l) => self.log.push((LineKind::Normal, l)),
+                    JobMsg::Done(Ok(())) => {
+                        self.log.push((LineKind::Ok, "Done.".into()));
+                        finished = true;
+                    }
+                    JobMsg::Done(Err(e)) => {
+                        self.log.push((LineKind::Error, format!("Failed: {e}")));
+                        finished = true;
+                    }
+                }
+            }
+        }
+        if finished {
+            self.job = None;
+            self.refresh(ctx);
+        }
+    }
+
+    fn installed(&self) -> bool {
+        self.status.as_ref().is_some_and(|s| s.installed())
+    }
+
+    fn elevated(&self) -> bool {
+        self.status.as_ref().is_some_and(|s| s.elevated)
+    }
+
+    // ---------------------------------------------------------------- Status
+
+    fn status_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let loading = self.status_rx.is_some();
+            if ui.add_enabled(!loading, egui::Button::new("⟳ Refresh")).clicked() {
+                self.refresh(ui.ctx());
+            }
+            if loading {
+                ui.spinner();
+                ui.label("Collecting status…");
+            }
+        });
+        ui.add_space(6.0);
+
+        let Some(s) = self.status.clone() else {
+            return;
+        };
+        let (level, text) = report::headline(&s);
+        egui::Frame::new()
+            .fill(level_color(level).gamma_multiply(0.18))
+            .stroke(egui::Stroke::new(1.0, level_color(level)))
+            .inner_margin(egui::Margin::same(10))
+            .corner_radius(4.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(format!("{}  {text}", level_icon(level)))
+                        .size(16.0)
+                        .color(level_color(level))
+                        .strong(),
+                );
+            });
+        ui.add_space(8.0);
+
+        egui::Grid::new("status_grid")
+            .num_columns(3)
+            .striped(true)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                for r in report::rows(&s) {
+                    ui.label(RichText::new(level_icon(r.level)).color(level_color(r.level)));
+                    ui.strong(r.label);
+                    ui.add(egui::Label::new(&r.text).wrap());
+                    ui.end_row();
+                }
+            });
+        ui.add_space(8.0);
+
+        ui.horizontal_wrapped(|ui| {
+            let enabled = !self.busy() && s.elevated;
+            if s.badram_first() == Some(false)
+                && ui.add_enabled(enabled, egui::Button::new("Put BadRAM first in boot order")).clicked()
+            {
+                self.start_job(ui.ctx(), "Fix boot order", ops::fix_boot_order);
+            }
+            if matches!(s.truncatememory, Ok(Some(_))) {
+                let ok = s.verdict() == Verdict::Protected;
+                let resp = ui.add_enabled(enabled && ok, egui::Button::new("Remove memory limit…"));
+                let resp = if ok {
+                    resp.on_hover_text("Remove truncatememory so Windows can use all good memory.")
+                } else {
+                    resp.on_disabled_hover_text("Only possible when this boot is verified as protected.")
+                };
+                if resp.clicked() {
+                    self.confirm = Some(Confirm::RemoveLimit);
+                }
+            }
+            if ui.button("Open install folder").clicked() {
+                let _ = std::process::Command::new("explorer.exe").arg(paths::install_dir()).spawn();
+            }
+            if paths::log_file().is_file() && ui.button("View check.log").clicked() {
+                let _ = std::process::Command::new("notepad.exe").arg(paths::log_file()).spawn();
+            }
+        });
+
+        if let Ok(ranges) = &s.windows_ranges {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(format!("Physical memory used by Windows ({} ranges)", ranges.len()))
+                .show(ui, |ui| {
+                    let protected = s.protected_ranges();
+                    for r in ranges {
+                        ui.monospace(format!("{:>14} - {:<14} {:>10}", format!("{:#x}", r.start()),
+                            format!("{:#x}", r.end()), report::size(r.len())));
+                    }
+                    if !protected.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label("Protected ranges:");
+                        for r in protected {
+                            ui.monospace(format!("{:>14} - {:<14} {:>10}", format!("{:#x}", r.start()),
+                                format!("{:#x}", r.end()), report::size(r.len())));
+                        }
+                    }
+                });
+        }
+    }
+
+    // ---------------------------------------------------------- Configuration
+
+    fn config_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(format!("Source: {}", self.editor.source));
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Load installed").clicked() {
+                match sysstatus::load_installed_config() {
+                    Some(Ok(c)) => self.editor.load(&c, format!("installed ({})", paths::installed_cfg().display())),
+                    Some(Err(e)) => self.log.push((LineKind::Error, format!("Installed config is invalid: {e}"))),
+                    None => self.log.push((LineKind::Error, "No installed config found.".into())),
+                }
+            }
+            if ui.button("Open file…").clicked()
+                && let Some(p) = rfd::FileDialog::new().add_filter("badram.cfg", &["cfg", "txt"]).pick_file()
+            {
+                match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|t| {
+                    badram_core::config::parse(&t).map_err(|e| e.to_string())
+                }) {
+                    Ok(c) => self.editor.load(&c, p.display().to_string()),
+                    Err(e) => self.log.push((LineKind::Error, format!("{}: {e}", p.display()))),
+                }
+            }
+            let built = self.editor.build();
+            if ui.add_enabled(built.is_ok(), egui::Button::new("Save as…")).clicked()
+                && let Ok(c) = &built
+                && let Some(p) = rfd::FileDialog::new().set_file_name("badram.cfg").save_file()
+            {
+                match std::fs::write(&p, ops::config_file_text(c)) {
+                    Ok(()) => self.log.push((LineKind::Ok, format!("Saved {}", p.display()))),
+                    Err(e) => self.log.push((LineKind::Error, format!("Cannot save {}: {e}", p.display()))),
+                }
+            }
+        });
+        ui.separator();
+
+        ui.strong("Bad memory ranges");
+        ui.label(RichText::new("Physical addresses in hex; start inclusive, end exclusive. Rounded outward to 4 KiB pages.").weak());
+        // Fixed-size cells: inside a Grid, egui sizes TextEdits to the
+        // column, which collapses them to a few characters.
+        const FIELD: [f32; 2] = [180.0, 22.0];
+        let mut remove = None;
+        ui.horizontal(|ui| {
+            ui.add_sized(FIELD, egui::Label::new("Start"));
+            ui.add_sized(FIELD, egui::Label::new("End"));
+        });
+        for (i, row) in self.editor.rows.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add_sized(FIELD, egui::TextEdit::singleline(&mut row.start)
+                    .font(egui::TextStyle::Monospace).hint_text("0x100000000"));
+                ui.add_sized(FIELD, egui::TextEdit::singleline(&mut row.end)
+                    .font(egui::TextStyle::Monospace).hint_text("0x110000000"));
+                match Editor::row_range(row) {
+                    Ok(r) => ui.label(report::size(r.pages() * PAGE_SIZE)),
+                    Err(e) => ui.colored_label(level_color(Level::Bad), e),
+                };
+                if ui.small_button("✖").on_hover_text("Remove this range").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.editor.rows.remove(i);
+            if self.editor.rows.is_empty() {
+                self.editor.rows.push(RangeRow::default());
+            }
+        }
+        if ui.button("+ Add range").clicked() {
+            self.editor.rows.push(RangeRow::default());
+        }
+        ui.add_space(8.0);
+
+        egui::Grid::new("options").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.strong("Memory type");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.editor.memory_type, MemoryType::Unusable, "unusable")
+                    .on_hover_text("EfiUnusableMemory (8): memory with detected errors. Recommended.");
+                ui.radio_value(&mut self.editor.memory_type, MemoryType::Reserved, "reserved")
+                    .on_hover_text("EfiReservedMemoryType (0).");
+            });
+            ui.end_row();
+
+            ui.strong("On error");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.editor.on_error, OnError::Prompt, "prompt")
+                    .on_hover_text("Show the error and wait for B (boot) / R (reboot) / S (shut down). Recommended.");
+                ui.radio_value(&mut self.editor.on_error, OnError::Boot, "boot")
+                    .on_hover_text("Warn, then boot Windows anyway (unattended machines).");
+                ui.radio_value(&mut self.editor.on_error, OnError::Halt, "halt")
+                    .on_hover_text("Never boot after an error.");
+            });
+            ui.end_row();
+
+            ui.strong("Summary screen");
+            ui.add(egui::DragValue::new(&mut self.editor.timeout).range(0..=600).suffix(" s"));
+            ui.end_row();
+
+            ui.strong("Chainload");
+            ui.add(egui::TextEdit::singleline(&mut self.editor.chainload).desired_width(360.0).hint_text(DEFAULT_CHAINLOAD));
+            ui.end_row();
+        });
+        ui.add_space(8.0);
+
+        let built = self.editor.build();
+        match &built {
+            Ok(c) => {
+                let ranges = range::normalize(&c.ranges).unwrap_or_default();
+                let pages = range::total_pages(&ranges);
+                ui.colored_label(
+                    level_color(Level::Good),
+                    format!("✔ Valid: {} range(s) after alignment/merging, {} pages ({})",
+                        ranges.len(), pages, report::size(pages * PAGE_SIZE)),
+                );
+            }
+            Err(e) => {
+                ui.colored_label(level_color(Level::Bad), format!("✖ {e}"));
+            }
+        }
+        if let Ok(c) = &built {
+            egui::CollapsingHeader::new("Preview badram.cfg").show(ui, |ui| {
+                ui.monospace(c.to_text());
+            });
+        }
+        ui.add_space(6.0);
+        let can_apply = built.is_ok() && self.installed() && self.elevated() && !self.busy();
+        let resp = ui.add_enabled(can_apply, egui::Button::new("Apply to installed BadRAM…"));
+        let resp = if self.installed() {
+            resp.on_hover_text("Writes badram.cfg to the ESP. Takes effect on the next boot.")
+        } else {
+            resp.on_disabled_hover_text("BadRAM is not installed. Use the Install tab.")
+        };
+        if resp.clicked() {
+            self.confirm = Some(Confirm::ApplyConfig);
+        }
+    }
+
+    // --------------------------------------------------------------- Install
+
+    fn install_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(s) = self.status.clone() else {
+            ui.spinner();
+            return;
+        };
+        ui.strong("Pre-flight checks");
+        let built = self.editor.build();
+        let efi_ok = PathBuf::from(&self.efi_path).is_file();
+        let sb_on = s.secure_boot == Some(true);
+        let bl_on = s.bitlocker.as_deref() == Some("On");
+
+        let mut checks: Vec<(Level, &str, String)> = vec![
+            if s.elevated { (Level::Good, "Administrator", "yes".into()) } else { (Level::Bad, "Administrator", "no: restart BadRAM Manager as administrator".into()) },
+            match s.uefi { Some(true) => (Level::Good, "Boot mode", "UEFI".into()), Some(false) => (Level::Bad, "Boot mode", "Legacy BIOS (not supported)".into()), None => (Level::Info, "Boot mode", "unknown".into()) },
+            match &built { Ok(_) => (Level::Good, "Configuration", "valid (see Configuration tab)".into()), Err(e) => (Level::Bad, "Configuration", e.clone()) },
+            if efi_ok { (Level::Good, "badram.efi", "found".into()) } else { (Level::Bad, "badram.efi", "not found; choose the file below".into()) },
+        ];
+        checks.push(if sb_on {
+            (if self.allow_secure_boot { Level::Warn } else { Level::Bad }, "Secure Boot", "On: turn it off in the BIOS, or enroll badram.efi's hash in db".into())
+        } else {
+            (Level::Good, "Secure Boot", "Off".into())
+        });
+        checks.push(if bl_on {
+            (if self.suspend_bitlocker { Level::Warn } else { Level::Bad }, "BitLocker", "On: back up the recovery key, then allow suspending it".into())
+        } else {
+            (Level::Good, "BitLocker", s.bitlocker.clone().unwrap_or_else(|| "unknown".into()))
+        });
+        if s.fast_startup == Some(true) {
+            checks.push((Level::Warn, "Fast Startup", "On: consider \"powercfg /h off\"".into()));
+        }
+        egui::Grid::new("preflight").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+            for (l, label, text) in &checks {
+                ui.label(RichText::new(level_icon(*l)).color(level_color(*l)));
+                ui.strong(*label);
+                ui.label(text);
+                ui.end_row();
+            }
+        });
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            ui.label("badram.efi:");
+            ui.add(egui::TextEdit::singleline(&mut self.efi_path).desired_width(420.0));
+            if ui.button("Browse…").clicked()
+                && let Some(p) = rfd::FileDialog::new().add_filter("EFI application", &["efi"]).pick_file()
+            {
+                self.efi_path = p.display().to_string();
+            }
+        });
+        if bl_on {
+            ui.checkbox(&mut self.suspend_bitlocker, "Suspend BitLocker for 2 reboots (I have backed up the recovery key)");
+        }
+        if sb_on {
+            ui.checkbox(&mut self.allow_secure_boot, "Allow Secure Boot (I enrolled this badram.efi's hash in db)");
+        }
+        ui.add_space(8.0);
+
+        let blocked = !s.elevated || s.uefi == Some(false) || built.is_err() || !efi_ok
+            || (sb_on && !self.allow_secure_boot) || (bl_on && !self.suspend_bitlocker);
+        let label = if s.installed() { "Update installation…" } else { "Install…" };
+        if ui.add_enabled(!blocked && !self.busy(), egui::Button::new(RichText::new(label).strong())).clicked() {
+            self.confirm = Some(Confirm::Install);
+        }
+
+        if s.installed() {
+            ui.add_space(16.0);
+            ui.separator();
+            ui.strong("Uninstall");
+            ui.label("Removes the boot entry, the files on the ESP and the logon task. Windows can use the bad memory again after the next boot.");
+            if ui.add_enabled(s.elevated && !self.busy(), egui::Button::new("Uninstall…")).clicked() {
+                self.confirm = Some(Confirm::Uninstall);
+            }
+        }
+    }
+
+    // --------------------------------------------------------------- Dialogs
+
+    fn confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(which) = self.confirm else { return };
+        let (title, body): (&str, String) = match which {
+            Confirm::Install => {
+                let summary = self.editor.build().map(|c| {
+                    let r = range::normalize(&c.ranges).unwrap_or_default();
+                    format!("{} range(s), {} pages", r.len(), range::total_pages(&r))
+                }).unwrap_or_default();
+                ("Install BadRAM?", format!(
+                    "This changes the firmware boot order so badram.efi starts before Windows.\n\n\
+                     Configuration: {summary}\nbadram.efi: {}\n\nA BCD backup is saved first.", self.efi_path))
+            }
+            Confirm::Uninstall => ("Uninstall BadRAM?", "Windows Boot Manager is put first again and BadRAM is removed.\n\n\
+                 After the next boot Windows CAN use the bad memory again. Restore a memory limit first if needed.".into()),
+            Confirm::ApplyConfig => ("Apply configuration?", "badram.cfg on the ESP is replaced. The new ranges take effect on the next boot.".into()),
+            Confirm::RemoveLimit => ("Remove memory limit?", "truncatememory is removed from the running Windows entry, so Windows uses all memory \
+                 badram.efi does not reserve.\n\nOnly do this while BadRAM protection is verified.".into()),
+        };
+        let mut decision = None;
+        egui::Modal::new(egui::Id::unique("badram-confirm")).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.heading(title);
+            ui.add_space(6.0);
+            ui.label(body);
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Confirm").strong()).clicked() {
+                    decision = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    decision = Some(false);
+                }
+            });
+        });
+        match decision {
+            Some(true) => {
+                self.confirm = None;
+                self.run_confirmed(ctx, which);
+            }
+            Some(false) => self.confirm = None,
+            None => {}
+        }
+    }
+
+    fn run_confirmed(&mut self, ctx: &egui::Context, which: Confirm) {
+        match which {
+            Confirm::Install => {
+                let Ok(c) = self.editor.build() else { return };
+                let opts = InstallOptions {
+                    config_text: c.to_text(),
+                    efi: PathBuf::from(&self.efi_path),
+                    suspend_bitlocker: self.suspend_bitlocker,
+                    allow_secure_boot: self.allow_secure_boot,
+                };
+                self.start_job(ctx, "Install", move |log| ops::install(&opts, log));
+            }
+            Confirm::Uninstall => self.start_job(ctx, "Uninstall", ops::uninstall),
+            Confirm::ApplyConfig => {
+                let Ok(c) = self.editor.build() else { return };
+                let text = c.to_text();
+                self.start_job(ctx, "Apply configuration", move |log| ops::apply_config(&text, log));
+            }
+            Confirm::RemoveLimit => self.start_job(ctx, "Remove memory limit", ops::remove_memory_limit),
+        }
+    }
+
+    fn log_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Log");
+            if self.busy() {
+                ui.spinner();
+            }
+            if ui.small_button("Clear").clicked() {
+                self.log.clear();
+            }
+        });
+        egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+            for (kind, line) in &self.log {
+                let text = RichText::new(line).monospace();
+                ui.label(match kind {
+                    LineKind::Header => text.strong(),
+                    LineKind::Normal => text,
+                    LineKind::Ok => text.color(level_color(Level::Good)),
+                    LineKind::Error => text.color(level_color(Level::Bad)),
+                });
+            }
+        });
+    }
+}
+
+impl eframe::App for ManagerApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.poll(&ctx);
+
+        egui::Panel::top("header").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading("BadRAM Manager");
+                if !self.elevated() && self.status.is_some() {
+                    ui.colored_label(level_color(Level::Warn), "⚠ not running as administrator");
+                    if ui.small_button("Restart as administrator").clicked() && crate::win::relaunch_elevated("") {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Status, "Status");
+                ui.selectable_value(&mut self.tab, Tab::Config, "Configuration");
+                ui.selectable_value(&mut self.tab, Tab::Install, "Install / Uninstall");
+            });
+            ui.add_space(2.0);
+        });
+
+        if !self.log.is_empty() || self.busy() {
+            egui::Panel::bottom("log").resizable(true).default_size(160.0).show(ui, |ui| {
+                self.log_panel(ui);
+            });
+        }
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
+                Tab::Status => self.status_tab(ui),
+                Tab::Config => self.config_tab(ui),
+                Tab::Install => self.install_tab(ui),
+            });
+        });
+
+        self.confirm_dialog(&ctx);
+    }
+}
+
+/// Adds Windows fonts as fallbacks: Segoe UI Symbol for the status icons
+/// (✔ ✖ ⚠ ⟳, missing from egui's default fonts) and Microsoft JhengHei so
+/// localized bcdedit/system messages render. The UI itself is English.
+fn install_cjk_fallback(ctx: &egui::Context) {
+    let Some(windir) = std::env::var_os("WINDIR") else { return };
+    let fonts_dir = PathBuf::from(windir).join("Fonts");
+    let groups: [(&str, &[&str]); 2] = [
+        ("symbols", &["seguisym.ttf"]),
+        ("cjk", &["msjh.ttc", "msyh.ttc", "simsun.ttc"]),
+    ];
+    let mut fonts = egui::FontDefinitions::default();
+    for (name, files) in groups {
+        let Some(bytes) = files.iter().find_map(|f| std::fs::read(fonts_dir.join(f)).ok()) else {
+            continue;
+        };
+        fonts.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(name.into());
+        }
+    }
+    ctx.set_fonts(fonts);
+}

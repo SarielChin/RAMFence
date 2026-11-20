@@ -7,6 +7,8 @@ UEFI 開機前程式（Rust），在 Windows Boot Manager 啟動前把設定的�
 - 安裝 target：`rustup target add x86_64-unknown-uefi`
 - 建置：`cargo build -p badram-efi --target x86_64-unknown-uefi --release`
 - 測試純邏輯：`cargo test -p badram-core`
+- GUI 管理工具：`cargo build -p badram-manager --release`（Windows GNU toolchain 需要 MinGW-w64 的 `dlltool`、`as` 在 PATH；測試：`cargo test -p badram-manager`）
+  - `badram-manager.exe --status` 印出狀態報告；`--check` 是登入排程用的無視窗檢查
 - QEMU 測試：需要 OVMF（見 DESIGN.md §7）
 
 ## 規則

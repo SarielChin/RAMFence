@@ -274,8 +274,27 @@ fn match_value<T: Copy>(
         })
 }
 
+impl Config {
+    /// Serializes back to `badram.cfg` syntax. `parse(&c.to_text()) == Ok(c)`.
+    pub fn to_text(&self) -> String {
+        use core::fmt::Write;
+        let mut s = String::new();
+        // Writing to a String cannot fail.
+        for r in &self.ranges {
+            let _ = writeln!(s, "range {:#x} {:#x}", r.start(), r.end());
+        }
+        let _ = writeln!(s, "memory_type {}", self.memory_type.name());
+        let _ = writeln!(s, "on_error {}", self.on_error.name());
+        let _ = writeln!(s, "timeout {}", self.timeout_secs);
+        if let Some(path) = &self.chainload {
+            let _ = writeln!(s, "chainload {path}");
+        }
+        s
+    }
+}
+
 /// Parses `0x`-prefixed hex; `_` separators are allowed (`0x3_5000_0000`).
-fn parse_address(s: &str) -> Result<u64, ParseErrorKind> {
+pub fn parse_address(s: &str) -> Result<u64, ParseErrorKind> {
     let invalid = || ParseErrorKind::InvalidAddress(s.into());
     let hex = s
         .strip_prefix("0x")
@@ -485,6 +504,27 @@ chainload \\EFI\\Some Dir\\shell.efi
         assert_eq!(e.to_string(), "badram.cfg line 2: unknown key 'foo'");
         let e = parse("").unwrap_err();
         assert_eq!(e.to_string(), "badram.cfg: no 'range' line found");
+    }
+
+    #[test]
+    fn to_text_round_trips() {
+        let original = Config {
+            ranges: vec![r(0x1234, 0x5678), r(0x1_0000_0000, 0x1_1000_0000)],
+            memory_type: MemoryType::Reserved,
+            on_error: OnError::Halt,
+            timeout_secs: 7,
+            chainload: Some("\\EFI\\Some Dir\\x.efi".into()),
+        };
+        let text = original.to_text();
+        assert_eq!(
+            text,
+            "range 0x1234 0x5678\nrange 0x100000000 0x110000000\nmemory_type reserved\n\
+             on_error halt\ntimeout 7\nchainload \\EFI\\Some Dir\\x.efi\n"
+        );
+        assert_eq!(parse(&text), Ok(original));
+
+        let minimal = parse("range 0x1000 0x2000").unwrap();
+        assert_eq!(parse(&minimal.to_text()), Ok(minimal));
     }
 
     #[test]

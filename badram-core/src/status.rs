@@ -7,6 +7,7 @@
 //! ```
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 use crate::config::MemoryType;
@@ -45,9 +46,109 @@ pub fn format_status(
     s
 }
 
+/// Parsed contents of `BadRamStatus`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusInfo {
+    pub version: u32,
+    pub ok: bool,
+    pub ranges: Vec<Range>,
+    pub pages: u64,
+    /// `None` if the type field is missing or unknown.
+    pub memory_type: Option<MemoryType>,
+    pub error: Option<String>,
+}
+
+/// Parses a status string written by [`format_status`]. Unknown keys are
+/// ignored; a missing or malformed `version`/`ok` is an error. A trailing
+/// NUL (as read back from firmware) is tolerated.
+pub fn parse_status(text: &str) -> Option<StatusInfo> {
+    let text = text.trim_end_matches('\0');
+    let mut version = None;
+    let mut ok = None;
+    let mut ranges = Vec::new();
+    let mut pages = 0;
+    let mut memory_type = None;
+    let mut error = None;
+
+    for field in text.split(';') {
+        let (key, value) = field.split_once('=')?;
+        match key {
+            "version" => version = Some(value.parse().ok()?),
+            "ok" => {
+                ok = Some(match value {
+                    "1" => true,
+                    "0" => false,
+                    _ => return None,
+                })
+            }
+            "ranges" => {
+                for part in value.split(',').filter(|p| !p.is_empty()) {
+                    let (a, b) = part.split_once('-')?;
+                    let a = crate::config::parse_address(a).ok()?;
+                    let b = crate::config::parse_address(b).ok()?;
+                    ranges.push(Range::new(a, b).ok()?);
+                }
+            }
+            "pages" => pages = value.parse().ok()?,
+            "type" => {
+                memory_type = match value {
+                    "unusable" => Some(MemoryType::Unusable),
+                    "reserved" => Some(MemoryType::Reserved),
+                    _ => None,
+                }
+            }
+            "error" => error = Some(String::from(value)),
+            _ => {}
+        }
+    }
+
+    Some(StatusInfo {
+        version: version?,
+        ok: ok?,
+        ranges,
+        pages,
+        memory_type,
+        error,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_round_trips() {
+        let ranges = [r(0x1000, 0x2000), r(0x5000, 0x6000)];
+        let s = format_status(false, &ranges, 2, MemoryType::Reserved, Some("x; y"));
+        assert_eq!(
+            parse_status(&s),
+            Some(StatusInfo {
+                version: 1,
+                ok: false,
+                ranges: ranges.to_vec(),
+                pages: 2,
+                memory_type: Some(MemoryType::Reserved),
+                error: Some("x, y".into()),
+            })
+        );
+        let ok = format_status(true, &[r(0x1000, 0x2000)], 1, MemoryType::Unusable, None);
+        let mut with_nul = ok.clone();
+        with_nul.push('\0');
+        let parsed = parse_status(&with_nul).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.error, None);
+        assert_eq!(parse_status(&ok), Some(parsed));
+    }
+
+    #[test]
+    fn parse_rejects_garbage() {
+        assert_eq!(parse_status(""), None);
+        assert_eq!(parse_status("hello"), None);
+        assert_eq!(parse_status("version=1"), None); // no ok
+        assert_eq!(parse_status("version=1;ok=2"), None);
+        assert_eq!(parse_status("version=1;ok=1;ranges=0x2000-0x1000"), None);
+        assert!(parse_status("version=1;ok=1;future=thing").is_some());
+    }
 
     fn r(start: u64, end: u64) -> Range {
         Range::new(start, end).unwrap()

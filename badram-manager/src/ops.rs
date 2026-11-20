@@ -1,0 +1,383 @@
+//! Install / uninstall / apply config / repairs / headless `--check`.
+//! Mirrors windows/*.ps1 step for step. Every step reports through `log`;
+//! the first failure aborts and is returned.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use badram_core::{Config, Range, config, range};
+
+use crate::paths::{self, CFG_NAME, EFI_NAME, ENTRY_DESCRIPTION, ESP_DIR, ESP_EFI_PATH, EXE_NAME};
+use crate::state::{self, State};
+use crate::sysstatus::{self, Verdict};
+use crate::win::{self, Icon};
+use crate::{bcd, esp, task};
+
+pub type Log<'a> = &'a mut dyn FnMut(String);
+
+/// Parses and normalizes config text exactly like badram.efi does.
+pub fn validate_config(text: &str) -> Result<(Config, Vec<Range>), String> {
+    let cfg = config::parse(text).map_err(|e| e.to_string())?;
+    let ranges = range::normalize(&cfg.ranges).map_err(|e| e.to_string())?;
+    Ok((cfg, ranges))
+}
+
+/// Text written to disk: a header comment plus the canonical config.
+pub fn config_file_text(cfg: &Config) -> String {
+    format!(
+        "# badram.cfg, written by BadRAM Manager {}\n{}",
+        win::local_timestamp(),
+        cfg.to_text()
+    )
+}
+
+fn require_admin() -> Result<(), String> {
+    if win::is_elevated() {
+        Ok(())
+    } else {
+        Err("administrator rights are required".into())
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// Copies unless `from` and `to` are the same file (e.g. reinstalling the
+/// already-installed badram.efi).
+fn copy(from: &Path, to: &Path) -> Result<(), String> {
+    if same_file(from, to) {
+        return Ok(());
+    }
+    fs::copy(from, to)
+        .map(drop)
+        .map_err(|e| format!("cannot copy {} to {}: {e}", from.display(), to.display()))
+}
+
+fn write(to: &Path, text: &str) -> Result<(), String> {
+    fs::write(to, text).map_err(|e| format!("cannot write {}: {e}", to.display()))
+}
+
+fn check_efi_file(path: &Path) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.len() < 1024 || !bytes.starts_with(b"MZ") {
+        return Err(format!("{} does not look like an EFI executable", path.display()));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub struct InstallOptions {
+    pub config_text: String,
+    pub efi: PathBuf,
+    pub suspend_bitlocker: bool,
+    pub allow_secure_boot: bool,
+}
+
+pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
+    require_admin()?;
+    if win::booted_uefi() != Some(true) {
+        return Err("Windows was not booted in UEFI mode; badram.efi cannot be used".into());
+    }
+    let (cfg, ranges) = validate_config(&o.config_text)?;
+    log(format!(
+        "Config OK: {} range(s), {} pages",
+        ranges.len(),
+        range::total_pages(&ranges)
+    ));
+    check_efi_file(&o.efi)?;
+
+    let status = sysstatus::collect();
+    if status.secure_boot == Some(true) && !o.allow_secure_boot {
+        return Err("Secure Boot is on: the firmware would refuse the unsigned badram.efi and \
+                    boot Windows unprotected. Turn Secure Boot off, or enroll this badram.efi's \
+                    hash in db and tick \"Allow Secure Boot\"."
+            .into());
+    }
+    if status.bitlocker.as_deref() == Some("On") {
+        if !o.suspend_bitlocker {
+            return Err("BitLocker protects the system drive. Back up the recovery key \
+                        (manage-bde -protectors -get C:), then tick \"Suspend BitLocker\"."
+                .into());
+        }
+        log("Suspending BitLocker for 2 reboots".into());
+        win::run_ok(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 2 | Out-Null",
+            ],
+        )?;
+    }
+    if status.fast_startup == Some(true) {
+        log("Warning: Fast Startup is on; a resume from hibernation skips badram.efi \
+             (consider \"powercfg /h off\")."
+            .into());
+    }
+
+    let dir = paths::install_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let cfg_text = config_file_text(&cfg);
+    if let Ok(me) = std::env::current_exe() {
+        copy(&me, &dir.join(EXE_NAME))?;
+    }
+    copy(&o.efi, &dir.join(EFI_NAME))?;
+    write(&dir.join(CFG_NAME), &cfg_text)?;
+    let backup = dir.join(format!("BCD-backup-{}", win::local_timestamp().replace(':', "")));
+    bcd::export(&backup.to_string_lossy())?;
+    log(format!("Files copied to {}; BCD backup: {}", dir.display(), backup.display()));
+
+    esp::with_esp(|root| {
+        let esp_dir = root.join(ESP_DIR);
+        fs::create_dir_all(&esp_dir).map_err(|e| format!("cannot create {}: {e}", esp_dir.display()))?;
+        copy(&o.efi, &esp_dir.join(EFI_NAME))?;
+        write(&esp_dir.join(CFG_NAME), &cfg_text)?;
+        if !root.join(r"EFI\Microsoft\Boot\bootmgfw.efi").is_file() {
+            log("Warning: bootmgfw.efi not found on this ESP; badram.efi will search other volumes.".into());
+        }
+        Ok(())
+    })?;
+    log(format!("Copied badram.efi and badram.cfg to ESP \\{ESP_DIR}"));
+
+    let id = match state::load() {
+        Some(s) if bcd::entry_exists(&s.entry_id) => {
+            log(format!("Using existing boot entry {}", s.entry_id));
+            s.entry_id
+        }
+        _ => {
+            let id = bcd::create_firmware_entry(ENTRY_DESCRIPTION, ESP_EFI_PATH)?;
+            state::save(&State {
+                entry_id: id.clone(),
+                installed_at: win::local_timestamp(),
+            })?;
+            log(format!("Created firmware boot entry {id}"));
+            id
+        }
+    };
+
+    bcd::set_first(&id)?;
+    let order = bcd::firmware_boot_order()?;
+    if order.first() != Some(&id) {
+        return Err(format!("boot order did not change; first entry is {:?}", order.first()));
+    }
+    log("BadRAM is first in the firmware boot order".into());
+
+    task::register(&dir.join(EXE_NAME))?;
+    log(format!("Registered logon task \"{}\"", paths::TASK_NAME));
+    log("Installed. Reboot, then check the Status tab before removing any memory limit.".into());
+    Ok(())
+}
+
+pub fn uninstall(log: Log) -> Result<(), String> {
+    require_admin()?;
+    match state::load() {
+        Some(s) if bcd::entry_exists(&s.entry_id) => {
+            bcd::put_windows_boot_manager_first()?;
+            bcd::delete_entry(&s.entry_id)?;
+            log(format!("Windows Boot Manager first again; deleted entry {}", s.entry_id));
+        }
+        _ => log("No recorded BadRAM boot entry (already removed?)".into()),
+    }
+    esp::with_esp(|root| {
+        let d = root.join(ESP_DIR);
+        if d.exists() {
+            fs::remove_dir_all(&d).map_err(|e| format!("cannot delete {}: {e}", d.display()))?;
+        }
+        Ok(())
+    })?;
+    log(format!("Removed \\{ESP_DIR} from the ESP"));
+    task::unregister()?;
+    log("Removed logon task".into());
+
+    let dir = paths::install_dir();
+    let me = std::env::current_exe().ok().and_then(|p| fs::canonicalize(p).ok());
+    for name in [EFI_NAME, CFG_NAME, "state.json", "check.ps1", "uninstall.ps1", "common.ps1", EXE_NAME] {
+        let p = dir.join(name);
+        if !p.exists() {
+            continue;
+        }
+        if fs::canonicalize(&p).ok() == me {
+            log(format!("Leaving {} (currently running); delete it manually.", p.display()));
+            continue;
+        }
+        fs::remove_file(&p).map_err(|e| format!("cannot delete {}: {e}", p.display()))?;
+    }
+    log(format!("Deleted installed files (BCD backups and check.log kept in {})", dir.display()));
+    log("Uninstalled. After the next boot Windows can use the bad memory again.".into());
+    Ok(())
+}
+
+/// Writes a new config to the install directory and the ESP. Takes effect
+/// on the next boot.
+pub fn apply_config(text: &str, log: Log) -> Result<(), String> {
+    require_admin()?;
+    if state::load().is_none() {
+        return Err("BadRAM is not installed".into());
+    }
+    let (cfg, ranges) = validate_config(text)?;
+    let cfg_text = config_file_text(&cfg);
+    write(&paths::installed_cfg(), &cfg_text)?;
+    esp::with_esp(|root| write(&root.join(ESP_DIR).join(CFG_NAME), &cfg_text))?;
+    log(format!(
+        "Config applied ({} pages). It takes effect on the next boot.",
+        range::total_pages(&ranges)
+    ));
+    Ok(())
+}
+
+pub fn fix_boot_order(log: Log) -> Result<(), String> {
+    require_admin()?;
+    let s = state::load().ok_or("BadRAM is not installed")?;
+    if !bcd::entry_exists(&s.entry_id) {
+        return Err(format!("boot entry {} no longer exists; install again", s.entry_id));
+    }
+    bcd::set_first(&s.entry_id)?;
+    log("BadRAM is first in the firmware boot order again".into());
+    Ok(())
+}
+
+/// Removes `truncatememory` from the running entry, but only when this boot
+/// is verifiably protected.
+pub fn remove_memory_limit(log: Log) -> Result<(), String> {
+    require_admin()?;
+    let st = sysstatus::collect();
+    if st.verdict() != Verdict::Protected {
+        return Err("this boot is not verified as protected; keep the memory limit".into());
+    }
+    bcd::remove_current_truncatememory()?;
+    log("Removed truncatememory from {current}. All memory is usable after the next boot.".into());
+    Ok(())
+}
+
+fn append_check_log(line: &str) {
+    use std::io::Write;
+    let line = format!("{}  {line}\r\n", win::local_timestamp());
+    if paths::install_dir().is_dir()
+        && let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(paths::log_file())
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// `--check`: run at logon by the scheduled task. Returns the exit code:
+/// 0 OK, 1 check failed, 2 boot not protected, 3 badram.efi/memory problem.
+pub fn run_check() -> i32 {
+    const TITLE: &str = "BadRAM";
+    if !win::is_elevated() {
+        append_check_log("Check failed: not running as administrator");
+        win::message_box(TITLE, "BadRAM check must run as administrator.", Icon::Error);
+        return 1;
+    }
+    let Some(s) = state::load() else {
+        append_check_log("Check failed: BadRAM is not installed");
+        return 1;
+    };
+
+    // Boot order first, so it is repaired even if we alert below.
+    let mut order_note = String::new();
+    if !bcd::entry_exists(&s.entry_id) {
+        order_note = format!("The BadRAM boot entry {} no longer exists. Install again.", s.entry_id);
+    } else {
+        match bcd::firmware_boot_order() {
+            Ok(order) if order.first() == Some(&s.entry_id) => {}
+            Ok(order) => match bcd::set_first(&s.entry_id) {
+                Ok(()) => append_check_log(&format!(
+                    "Boot order restored: BadRAM is first again (was: {})",
+                    order.first().map_or("(none)", |x| x.as_str())
+                )),
+                Err(e) => order_note = format!("Could not restore the boot order: {e}"),
+            },
+            Err(e) => order_note = format!("Could not read the boot order: {e}"),
+        }
+    }
+    if !order_note.is_empty() {
+        append_check_log(&order_note);
+    }
+    let with_note = |msg: String| {
+        if order_note.is_empty() { msg } else { format!("{msg}\n\n{order_note}") }
+    };
+
+    let st = sysstatus::collect();
+    match st.verdict() {
+        Verdict::Protected => {
+            let info = st.badram.as_ref();
+            append_check_log(&format!(
+                "OK: ranges={} pages={}",
+                info.map(|i| i.ranges.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(","))
+                    .unwrap_or_default(),
+                info.map_or(0, |i| i.pages)
+            ));
+            if !order_note.is_empty() {
+                win::message_box(TITLE, &order_note, Icon::Warning);
+            }
+            0
+        }
+        Verdict::NotProtected | Verdict::NotInstalled => {
+            append_check_log("NOT PROTECTED: BadRamStatus variable missing");
+            win::message_box(
+                TITLE,
+                &with_note(
+                    "This boot did NOT go through badram.efi, so bad memory may be in use right now.\n\n\
+                     Possible causes: the boot order was changed (restored now unless noted below), \
+                     Secure Boot rejected badram.efi, or Windows resumed from hibernation.\n\n\
+                     Save your work and RESTART NOW."
+                        .into(),
+                ),
+                Icon::Error,
+            );
+            2
+        }
+        Verdict::Problem(p) => {
+            append_check_log(&format!("PROBLEM: {p}"));
+            win::message_box(
+                TITLE,
+                &with_note(format!("Bad memory may not be fully protected.\n\n{p}")),
+                Icon::Error,
+            );
+            3
+        }
+        Verdict::Unknown(u) => {
+            append_check_log(&format!("Check failed: {u}"));
+            win::message_box(TITLE, &with_note(format!("BadRAM check failed:\n\n{u}")), Icon::Warning);
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_matches_efi_parser() {
+        let (cfg, ranges) = validate_config("range 0x1234 0x5678\non_error boot").unwrap();
+        assert_eq!(cfg.on_error, badram_core::OnError::Boot);
+        assert_eq!(ranges, vec![Range::new(0x1000, 0x6000).unwrap()]);
+        assert!(validate_config("range 0x2000 0x1000").is_err());
+        assert!(validate_config("").is_err());
+    }
+
+    #[test]
+    fn copy_onto_itself_is_a_no_op() {
+        let dir = std::env::temp_dir().join(format!("badram-copy-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.bin");
+        fs::write(&f, b"content").unwrap();
+        copy(&f, &f).unwrap();
+        assert_eq!(fs::read(&f).unwrap(), b"content");
+        let g = dir.join("y.bin");
+        copy(&f, &g).unwrap();
+        assert_eq!(fs::read(&g).unwrap(), b"content");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn written_config_reparses() {
+        let (cfg, _) = validate_config("range 0x1000 0x2000\ntimeout 9").unwrap();
+        let text = config_file_text(&cfg);
+        assert!(text.starts_with("# badram.cfg, written by BadRAM Manager "));
+        assert_eq!(config::parse(&text).unwrap(), cfg);
+    }
+}
