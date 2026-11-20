@@ -37,13 +37,15 @@ Push-Location $Root
 try {
     Invoke-Cargo build -p badram-efi --target x86_64-unknown-uefi --release
     Invoke-Cargo test -p badram-core -p badram-manager
-    Invoke-Cargo build -p badram-manager --release
+    # Separate target dir: a running copy of target\release\badram-manager.exe
+    # (e.g. open for testing) would otherwise lock the output file.
+    Invoke-Cargo build -p badram-manager --release --target-dir target\pkg
 
     $version = (Select-String -Path badram-manager\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
     $dist = Join-Path $Root 'dist'
     New-Item -ItemType Directory -Force $dist | Out-Null
     $out = Join-Path $dist "BadRAM-Manager-$version.exe"
-    Copy-Item target\release\badram-manager.exe $out -Force
+    Copy-Item target\pkg\release\badram-manager.exe $out -Force
 
     $efi = [IO.File]::ReadAllBytes((Join-Path $Root 'target\x86_64-unknown-uefi\release\badram.efi'))
     $exe = [IO.File]::ReadAllBytes($out)

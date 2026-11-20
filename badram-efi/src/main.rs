@@ -71,7 +71,7 @@ fn main() -> Status {
 
     // A scheduled memory test runs before anything is reserved, so it can
     // also cover the configured bad ranges themselves.
-    let tested = image_dir().is_ok_and(|dir| memtest::run_if_requested(&dir, &mut log));
+    let mut tested = image_dir().is_ok_and(|dir| memtest::run_if_requested(&dir, &mut log));
 
     let mode = config.as_ref().map_or(Mode::Protect, |c| c.mode);
     let mut ranges: Vec<Range> = Vec::new();
@@ -81,9 +81,20 @@ fn main() -> Status {
         // an error; but say clearly that nothing is protected.
         log.warn("scan-only mode: no memory is reserved during this boot");
     } else if let Some(cfg) = &config {
-        match range::normalize(&cfg.ranges) {
-            Ok(r) => ranges = r,
-            Err(e) => log.error(format_args!("{CONFIG_NAME}: {e}")),
+        if mode == Mode::Auto {
+            match image_dir() {
+                Ok(dir) => {
+                    let (found, scanned) = memtest::auto(&dir, &mut log);
+                    ranges = found;
+                    tested |= scanned;
+                }
+                Err(e) => log.error(format_args!("auto mode: {e}")),
+            }
+        } else {
+            match range::normalize(&cfg.ranges) {
+                Ok(r) => ranges = r,
+                Err(e) => log.error(format_args!("{CONFIG_NAME}: {e}")),
+            }
         }
         for r in &ranges {
             log.info(format_args!(

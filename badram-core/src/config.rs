@@ -78,6 +78,10 @@ pub enum Mode {
     /// Reserve nothing: only run a scheduled memory test, then boot. Used
     /// to find the bad ranges on a new machine. Takes no `range` lines.
     ScanOnly,
+    /// Rescue USB: if no saved test result exists next to badram.efi, scan
+    /// all memory first and save the result; then reserve the error ranges
+    /// from that result (plus a margin). Takes no `range` lines.
+    Auto,
 }
 
 impl Mode {
@@ -85,9 +89,13 @@ impl Mode {
         match self {
             Mode::Protect => "protect",
             Mode::ScanOnly => "scan-only",
+            Mode::Auto => "auto",
         }
     }
 }
+
+/// Margin around found errors in `mode auto`.
+pub const AUTO_MARGIN: u64 = 256 << 20;
 
 pub const DEFAULT_TIMEOUT_SECS: u32 = 3;
 
@@ -127,8 +135,8 @@ pub enum ParseErrorKind {
     Range(RangeError),
     /// The file contains no `range` line (and the mode is `protect`).
     NoRanges,
-    /// `range` lines are not allowed with `mode scan-only`.
-    RangesInScanOnly,
+    /// `range` lines are not allowed with `mode scan-only` or `mode auto`.
+    RangesNotAllowed(&'static str),
 }
 
 impl fmt::Display for ParseError {
@@ -156,8 +164,8 @@ impl fmt::Display for ParseError {
             }
             ParseErrorKind::Range(e) => write!(f, "{e}"),
             ParseErrorKind::NoRanges => write!(f, "no 'range' line found"),
-            ParseErrorKind::RangesInScanOnly => {
-                write!(f, "'range' lines are not allowed with 'mode scan-only'")
+            ParseErrorKind::RangesNotAllowed(mode) => {
+                write!(f, "'range' lines are not allowed with 'mode {mode}'")
             }
         }
     }
@@ -211,6 +219,7 @@ pub fn parse(text: &str) -> Result<Config, ParseError> {
                 let v = match_value("mode", args[0], &[
                     ("protect", Mode::Protect),
                     ("scan-only", Mode::ScanOnly),
+                    ("auto", Mode::Auto),
                 ])
                 .map_err(err)?;
                 set_once("mode", &mut mode, v).map_err(err)?;
@@ -263,7 +272,9 @@ pub fn parse(text: &str) -> Result<Config, ParseError> {
     let whole_file = |kind| Err(ParseError { line: 0, kind });
     match mode {
         Mode::Protect if ranges.is_empty() => return whole_file(ParseErrorKind::NoRanges),
-        Mode::ScanOnly if !ranges.is_empty() => return whole_file(ParseErrorKind::RangesInScanOnly),
+        Mode::ScanOnly | Mode::Auto if !ranges.is_empty() => {
+            return whole_file(ParseErrorKind::RangesNotAllowed(mode.name()));
+        }
         _ => {}
     }
 
@@ -579,13 +590,23 @@ chainload \\EFI\\Some Dir\\shell.efi
         assert_eq!(c.to_text(), "mode scan-only\nmemory_type unusable\non_error boot\ntimeout 3\n");
         assert_eq!(parse(&c.to_text()), Ok(c));
 
-        assert_eq!(kind("mode scan-only\nrange 0x1000 0x2000"), (0, ParseErrorKind::RangesInScanOnly));
+        assert_eq!(kind("mode scan-only\nrange 0x1000 0x2000"), (0, ParseErrorKind::RangesNotAllowed("scan-only")));
         assert_eq!(kind("mode protect"), (0, ParseErrorKind::NoRanges));
         assert_eq!(parse("mode protect\nrange 0x1000 0x2000").unwrap().mode, Mode::Protect);
         assert_eq!(kind("range 0x1000 0x2000\nmode x"), (2, ParseErrorKind::InvalidValue { key: "mode", value: "x".into() }));
         assert_eq!(kind("mode protect\nmode protect\nrange 0x1000 0x2000"), (2, ParseErrorKind::DuplicateKey("mode")));
         // Protect is implicit, so files stay readable by older builds.
         assert!(!parse("range 0x1000 0x2000").unwrap().to_text().contains("mode"));
+    }
+
+    #[test]
+    fn auto_mode() {
+        let c = parse("mode auto\ntimeout 10\n").unwrap();
+        assert_eq!(c.mode, Mode::Auto);
+        assert_eq!(parse(&c.to_text()), Ok(c));
+        let e = parse("mode auto\nrange 0x1000 0x2000").unwrap_err();
+        assert_eq!(e.kind, ParseErrorKind::RangesNotAllowed("auto"));
+        assert_eq!(e.to_string(), "badram.cfg: 'range' lines are not allowed with 'mode auto'");
     }
 
     #[test]

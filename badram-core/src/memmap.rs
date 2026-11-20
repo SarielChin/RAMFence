@@ -190,6 +190,20 @@ pub fn verify(ranges: &[Range], map: &[MemDesc]) -> Vec<Segment> {
         .collect()
 }
 
+/// `[1 MiB, end of the highest RAM descriptor)`: the span a full memory scan
+/// covers. Reserved/MMIO descriptors (which can sit far above RAM) do not
+/// count; the first MiB holds legacy firmware areas and is skipped.
+pub fn ram_extent(map: &[MemDesc]) -> Option<Range> {
+    use mem_type::*;
+    let end = map
+        .iter()
+        .filter(|d| matches!(d.ty, LOADER_CODE..=ACPI_NVS | PERSISTENT))
+        .filter_map(MemDesc::range)
+        .map(|r| r.end())
+        .max()?;
+    Range::new(1 << 20, end).ok()
+}
+
 /// First range in `ranges` that overlaps `region` (e.g. our own loaded image).
 pub fn find_overlap(ranges: &[Range], region: &Range) -> Option<Range> {
     ranges.iter().copied().find(|r| r.overlaps(region))
@@ -347,6 +361,19 @@ mod tests {
             verify(&[r(0, 20 * P)], &map),
             vec![seg(CONVENTIONAL, 10 * P, 12 * P), seg(BOOT_SERVICES_CODE, 12 * P, 14 * P)]
         );
+    }
+
+    #[test]
+    fn ram_extent_ignores_mmio_and_reserved() {
+        let map = [
+            d(CONVENTIONAL, 0, 0x9F),
+            d(BOOT_SERVICES_DATA, 0x10_0000, 0x100),
+            d(CONVENTIONAL, 0x1_0000_0000, 0x10_0000), // up to 8 GiB
+            d(MMIO, 0xFFC0_0000, 0x400),
+            d(RESERVED, 0xFD_0000_0000, 0x30_0000), // far above RAM (QEMU)
+        ];
+        assert_eq!(ram_extent(&map), Some(r(1 << 20, 0x2_0000_0000)));
+        assert_eq!(ram_extent(&[d(MMIO, 0, 10)]), None);
     }
 
     #[test]

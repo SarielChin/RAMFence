@@ -15,6 +15,7 @@ use badram_core::memmap::{self, type_name};
 use badram_core::memtest::{
     self, REQUEST_FILE, RESULT_FILE, TestHost, TestMemory, TestResult, Untested,
 };
+use badram_core::config::AUTO_MARGIN;
 use badram_core::{PAGE_SIZE, Range};
 use uefi::boot::{self, AllocateType};
 use uefi::fs::FileSystem;
@@ -123,15 +124,72 @@ pub fn run_if_requested(dir: &str, log: &mut Log) -> bool {
     ));
     let result = run(&req.ranges, req.passes, log);
     summarize(&result, log);
+    save_result(dir, &res_path, &result, log);
+    true
+}
 
+fn save_result(dir: &str, path: &CString16, result: &TestResult, log: &mut Log) {
     match open_fs().and_then(|mut fs| {
-        fs.write(&*res_path, result.to_text().as_bytes())
+        fs.write(&**path, result.to_text().as_bytes())
             .map_err(|e| format!("cannot write {RESULT_FILE}: {e:?}"))
     }) {
         Ok(()) => log.info(format_args!("Result saved to {dir}{RESULT_FILE}")),
         Err(e) => log.warn(format_args!("memory test: {e}")),
     }
-    true
+}
+
+/// `mode auto` (rescue USB): use the saved result next to badram.efi, or
+/// scan all memory once and save it. Returns the ranges to reserve (error
+/// clusters plus [`AUTO_MARGIN`]) and whether a scan ran this boot.
+pub fn auto(dir: &str, log: &mut Log) -> (Vec<Range>, bool) {
+    let Some(res_path) = path16(dir, RESULT_FILE) else {
+        log.error("auto mode: invalid result path");
+        return (Vec::new(), false);
+    };
+    let saved = open_fs()
+        .ok()
+        .and_then(|mut fs| fs.read(&*res_path).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|t| memtest::parse_result(&t));
+
+    let (result, scanned) = match saved {
+        Some(r) => {
+            log.info(format_args!(
+                "Auto mode: using the saved scan result ({} error(s); delete {RESULT_FILE} to scan again)",
+                r.errors.count
+            ));
+            (r, false)
+        }
+        None => {
+            let extent = reserve::read_map().ok().and_then(|m| memmap::ram_extent(&m));
+            let Some(extent) = extent else {
+                log.error("auto mode: cannot determine the memory size to scan");
+                return (Vec::new(), false);
+            };
+            log.info("");
+            log.info(format_args!(
+                "Auto mode: first start, scanning all memory ({} MiB). This takes a few minutes.",
+                extent.len() >> 20
+            ));
+            let r = run(&[extent], 1, log);
+            summarize(&r, log);
+            if r.completed {
+                save_result(dir, &res_path, &r, log);
+            } else {
+                // Not saved: the next start scans again. Errors found so
+                // far are still reserved now.
+                log.warn("auto mode: scan was stopped; it runs again at the next start");
+            }
+            (r, true)
+        }
+    };
+    let ranges = result
+        .errors
+        .suggested_ranges(AUTO_MARGIN, 1 << 20, memtest::SUGGEST_GAP);
+    if ranges.is_empty() {
+        log.info("Auto mode: no bad memory found; nothing to reserve.");
+    }
+    (ranges, scanned)
 }
 
 fn run(ranges: &[Range], passes: u32, log: &mut Log) -> TestResult {

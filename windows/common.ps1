@@ -227,7 +227,7 @@ function Test-BadRamConfig([string]$Path) {
                 }
             }
             'mode' {
-                if ($parts.Count -ne 2 -or $parts[1] -notin 'protect', 'scan-only') { $errors += "line ${n}: mode must be protect or scan-only" }
+                if ($parts.Count -ne 2 -or $parts[1] -notin 'protect', 'scan-only', 'auto') { $errors += "line ${n}: mode must be protect, scan-only or auto" }
                 else { $mode = $parts[1] }
             }
             'memory_type' { if ($parts.Count -ne 2 -or $parts[1] -notin 'unusable', 'reserved') { $errors += "line ${n}: memory_type must be unusable or reserved" } }
@@ -238,6 +238,6 @@ function Test-BadRamConfig([string]$Path) {
         }
     }
     if ($mode -eq 'protect' -and $ranges -eq 0) { $errors += "no 'range' line" }
-    if ($mode -eq 'scan-only' -and $ranges -gt 0) { $errors += "'range' lines are not allowed with 'mode scan-only'" }
+    if ($mode -ne 'protect' -and $ranges -gt 0) { $errors += "'range' lines are not allowed with 'mode $mode'" }
     , $errors
 }

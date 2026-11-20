@@ -456,6 +456,151 @@ pub fn start_first_scan(efi: EfiSource, scan: Range, passes: u32, allow_secure_b
     schedule_test(&req.to_text(), log)
 }
 
+// ------------------------------------------------------------- rescue USB
+
+/// A USB disk as reported by `Get-Disk`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UsbDisk {
+    pub number: u32,
+    pub friendly_name: String,
+    pub size: u64,
+    pub is_boot: bool,
+    pub is_system: bool,
+}
+
+impl UsbDisk {
+    /// Disks Windows itself starts from must never be erased.
+    pub fn erasable(&self) -> bool {
+        !self.is_boot && !self.is_system
+    }
+}
+
+pub fn parse_usb_disks(json: &str) -> Result<Vec<UsbDisk>, String> {
+    let json = json.trim();
+    if json.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(json).map_err(|e| format!("cannot read the disk list: {e}"))
+}
+
+pub fn list_usb_disks() -> Result<Vec<UsbDisk>, String> {
+    let out = win::run_ok(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "ConvertTo-Json -Compress -InputObject @(Get-Disk | Where-Object { $_.BusType -eq 'USB' } | \
+             Select-Object Number, FriendlyName, @{n='Size';e={[uint64]$_.Size}}, IsBoot, IsSystem)",
+        ],
+    )?;
+    parse_usb_disks(&out)
+}
+
+const USB_CONFIG: &str = "\
+# BadRAM rescue USB: scan all memory on the first start, save the result on
+# this stick, then reserve the damaged areas on every start.
+mode auto
+on_error prompt
+timeout 10
+";
+
+const USB_README: &str = "\
+BadRAM rescue USB
+=================
+
+This stick protects a PC with damaged memory (RAM), even when Windows
+cannot start normally.
+
+1. Secure Boot must be off in the PC's firmware settings (BIOS).
+2. Plug in the stick, switch the PC on and open the boot menu (often F12,
+   F11, F8, Esc or F10 while the maker's logo shows). Choose the USB stick
+   (the entry marked UEFI).
+3. First start: BadRAM tests all memory (a few minutes; Esc stops it),
+   saves the result on this stick, reserves the damaged areas, then starts
+   Windows. Later starts from this stick skip the test.
+4. In Windows, run BadRAM-Manager.exe from this stick (as administrator)
+   and follow the Setup tab to install BadRAM on the PC. After that the
+   stick is no longer needed.
+
+To test again, delete EFI\\BOOT\\test-result.txt from the stick.
+";
+
+/// Erases `disk` and makes it a rescue USB: badram.efi as the removable
+/// boot loader (\EFI\BOOT\BOOTX64.EFI) in `mode auto`, plus this manager
+/// and a README.
+pub fn create_usb(disk: &UsbDisk, efi: &EfiSource, log: Log) -> Result<(), String> {
+    require_admin()?;
+    if !disk.erasable() {
+        return Err("refusing to erase a disk Windows starts from".into());
+    }
+    let efi_bytes = efi.load()?;
+    let n = disk.number;
+    let size = disk.size;
+    // Re-checks the disk right before erasing: numbers can change when
+    // drives are plugged in or out.
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'
+$d = Get-Disk -Number {n}
+if ($d.BusType -ne 'USB' -or [uint64]$d.Size -ne {size} -or $d.IsBoot -or $d.IsSystem) {{
+    throw 'Disk {n} is no longer the selected USB drive. Refresh the list and try again.'
+}}
+if ($d.PartitionStyle -ne 'RAW') {{ Clear-Disk -Number {n} -RemoveData -RemoveOEM -Confirm:$false }}
+if ((Get-Disk -Number {n}).PartitionStyle -eq 'RAW') {{ Initialize-Disk -Number {n} -PartitionStyle GPT }}
+$d = Get-Disk -Number {n}
+$size = [Math]::Min([uint64]2GB, [uint64]$d.LargestFreeExtent)
+if ($d.PartitionStyle -eq 'GPT') {{
+    $p = New-Partition -DiskNumber {n} -Size $size -GptType '{{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}}' -AssignDriveLetter
+}} else {{
+    $p = New-Partition -DiskNumber {n} -Size $size -MbrType FAT32 -AssignDriveLetter
+}}
+$v = Format-Volume -Partition $p -FileSystem FAT32 -NewFileSystemLabel 'BADRAM' -Confirm:$false
+if (-not $v.DriveLetter) {{ throw 'The new partition got no drive letter.' }}
+Write-Output (\"LETTER=\" + $v.DriveLetter)"
+    );
+    log(format!("Erasing disk {n} ({}) and creating a FAT32 partition…", disk.friendly_name));
+    let out = win::run_ok("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", &script])?;
+    let letter = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("LETTER="))
+        .and_then(|s| s.chars().next())
+        .ok_or_else(|| format!("could not find the new drive letter: {}", out.trim()))?;
+    let root = PathBuf::from(format!("{letter}:\\"));
+    log(format!("Formatted as {letter}:"));
+
+    let boot = root.join(r"EFI\BOOT");
+    fs::create_dir_all(&boot).map_err(|e| format!("cannot create {}: {e}", boot.display()))?;
+    write_bytes(&boot.join("BOOTX64.EFI"), &efi_bytes)?;
+    write(&boot.join(CFG_NAME), USB_CONFIG)?;
+    if let Ok(me) = std::env::current_exe() {
+        copy(&me, &root.join("BadRAM-Manager.exe"))?;
+    }
+    write(&root.join("README.txt"), &USB_README.replace('\n', "\r\n"))?;
+    log(format!(
+        "Rescue USB ready on {letter}: (badram.efi in auto mode, BadRAM-Manager.exe, README.txt). \
+         Eject it safely before unplugging."
+    ));
+    Ok(())
+}
+
+/// Installs BadRAM in protect mode with `ranges` and default settings (used
+/// after starting from a rescue USB stick).
+pub fn install_ranges(ranges: &[Range], efi: EfiSource, log: Log) -> Result<(), String> {
+    let cfg = Config {
+        mode: badram_core::Mode::Protect,
+        ranges: ranges.to_vec(),
+        memory_type: badram_core::MemoryType::Unusable,
+        on_error: badram_core::OnError::Prompt,
+        timeout_secs: config::DEFAULT_TIMEOUT_SECS,
+        chainload: None,
+    };
+    install(
+        &InstallOptions { config_text: cfg.to_text(), efi, suspend_bitlocker: false, allow_secure_boot: false },
+        log,
+    )
+}
+
 /// Writes a protect-mode config with `ranges` to the installation (keeping
 /// the other settings of the installed config).
 pub fn protect_ranges(ranges: &[Range], log: Log) -> Result<(), String> {
@@ -578,6 +723,27 @@ mod tests {
         assert_eq!(ranges, vec![Range::new(0x1000, 0x6000).unwrap()]);
         assert!(validate_config("range 0x2000 0x1000").is_err());
         assert!(validate_config("").is_err());
+    }
+
+    #[test]
+    fn usb_disk_list_parsing() {
+        let json = r#"[{"Number":2,"FriendlyName":"Some USB Stick","Size":30752000000,"IsBoot":false,"IsSystem":false},
+                       {"Number":3,"FriendlyName":"Boot USB","Size":64000000000,"IsBoot":true,"IsSystem":false}]"#;
+        let disks = parse_usb_disks(json).unwrap();
+        assert_eq!(disks.len(), 2);
+        assert_eq!(disks[0].number, 2);
+        assert!(disks[0].erasable());
+        assert!(!disks[1].erasable());
+        assert!(parse_usb_disks("").unwrap().is_empty());
+        assert!(parse_usb_disks("[]").unwrap().is_empty());
+        assert!(parse_usb_disks("not json").is_err());
+    }
+
+    #[test]
+    fn usb_config_is_valid_auto_mode() {
+        let (cfg, ranges) = validate_config(USB_CONFIG).unwrap();
+        assert_eq!(cfg.mode, badram_core::Mode::Auto);
+        assert!(ranges.is_empty());
     }
 
     #[test]

@@ -22,7 +22,7 @@
 #>
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('ok', 'reserved', 'missing-config', 'parse-error', 'conflict', 'halt', 'memtest', 'scan-only')]
+    [ValidateSet('ok', 'reserved', 'missing-config', 'parse-error', 'conflict', 'halt', 'memtest', 'scan-only', 'auto-scan', 'auto-saved')]
     [string]$Case,
 
     # "0xSTART 0xEND" for the conflict/halt cases: pick a BS_Data region
@@ -93,6 +93,21 @@ $Cases = @{
         TestReq = "scan 0x30000000 0x50000000`npasses 1`n"
         Keys    = @()
     }
+    'auto-scan'      = @{
+        # Rescue USB, first start: no saved result, so all RAM is scanned
+        # and the result saved. QEMU memory has no errors: nothing reserved.
+        Cfg  = "mode auto`non_error boot`ntimeout 0`nchainload $Missing`n"
+        Mem  = '768M'
+        Keys = @()
+    }
+    'auto-saved'     = @{
+        # Rescue USB, later start: the saved result (with two errors) is
+        # used without scanning; error cluster + 256 MiB margin reserved:
+        # expect Unusable 0x20000000-0x408FFFFF.
+        Cfg    = "mode auto`non_error boot`ntimeout 0`nchainload $Missing`n"
+        Result = "badram-test 1`nresult complete`npasses 1`nrequested 0x100000 0x80000000`ntested 0x100000 0x80000000`nerrors 2`nmask 0x0000ff0000000000`nlowest 0x30000100`nhighest 0x30800000`nbucket 0x30000000 2`nerror 0x30000100 0x30000100 0x0000ff0030000100`nerror 0x30800000 0x30800000 0x0000ff0030800000`n"
+        Keys   = @()
+    }
     'halt'           = @{
         Cfg  = "range $ConflictRange`non_error halt`ntimeout 0`nchainload $Missing`n"
         # B must be ignored under halt; S powers off.
@@ -136,6 +151,8 @@ function Write-Ascii([string]$Path, [string]$Text) {
 Copy-Item $Efi (Join-Path $Esp 'EFI\badram\badram.efi')
 if ($null -ne $Spec.Cfg) { Write-Ascii (Join-Path $Esp 'EFI\badram\badram.cfg') $Spec.Cfg }
 if ($Spec.ContainsKey('TestReq')) { Write-Ascii (Join-Path $Esp 'EFI\badram\test.req') $Spec.TestReq }
+if ($Spec.ContainsKey('Result')) { Write-Ascii (Join-Path $Esp 'EFI\badram\test-result.txt') $Spec.Result }
+$Mem = if ($Spec.ContainsKey('Mem')) { $Spec.Mem } else { '2G' }
 if ($Spec.Stage2) {
     New-Item -ItemType Directory -Force (Join-Path $Esp 'EFI\stage2') | Out-Null
     Copy-Item $Efi (Join-Path $Esp 'EFI\stage2\badram.efi')
@@ -162,7 +179,7 @@ Copy-Item (Join-Path $QemuDir 'share\edk2-i386-vars.fd') (Join-Path $CaseDir 'va
 
 $SerialLog = Join-Path $CaseDir 'serial.log'
 $QemuArgs = @(
-    '-machine', 'q35', '-accel', 'tcg', '-m', '2G', '-smp', '1',
+    '-machine', 'q35', '-accel', 'tcg', '-m', $Mem, '-smp', '1',
     '-drive', "if=pflash,format=raw,readonly=on,file=`"$(Join-Path $QemuDir 'share\edk2-x86_64-code.fd')`"",
     '-drive', 'if=pflash,format=raw,file=vars.fd',
     # vvfat: relative path, because a drive letter's ':' confuses the parser.

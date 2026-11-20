@@ -21,6 +21,7 @@ enum Tab {
     Status,
     Config,
     MemTest,
+    UsbTool,
     Install,
 }
 
@@ -45,6 +46,8 @@ enum Confirm {
     RemoveLimit,
     Restart,
     RestartFirmware,
+    ReplaceRanges,
+    CreateUsb,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -141,6 +144,7 @@ pub struct ManagerApp {
     confirm: Option<Confirm>,
     mt: MemTestState,
     setup: SetupState,
+    usb: UsbState,
     /// The first status picked the starting tab (Setup or Status).
     tab_chosen: bool,
 }
@@ -149,6 +153,16 @@ struct SetupState {
     recovery_keys: Option<Result<Vec<String>, String>>,
     key_saved: bool,
     passes: u32,
+    /// Ranges waiting for the "update ranges" confirmation.
+    pending_ranges: Vec<Range>,
+}
+
+struct UsbState {
+    disks: Option<Result<Vec<ops::UsbDisk>, String>>,
+    rx: Option<Receiver<Result<Vec<ops::UsbDisk>, String>>>,
+    /// Selected disk (number, size) — the size guards against renumbering.
+    selected: Option<(u32, u64)>,
+    erase_ok: bool,
 }
 
 struct MemTestState {
@@ -239,7 +253,8 @@ impl ManagerApp {
             log: Vec::new(),
             confirm: None,
             mt,
-            setup: SetupState { recovery_keys: None, key_saved: false, passes: 1 },
+            setup: SetupState { recovery_keys: None, key_saved: false, passes: 1, pending_ranges: Vec::new() },
+            usb: UsbState { disks: None, rx: None, selected: None, erase_ok: false },
             tab_chosen: false,
         };
         app.refresh(&cc.egui_ctx);
@@ -319,6 +334,12 @@ impl ManagerApp {
                     }
                 }
             }
+        }
+        if let Some(rx) = &self.usb.rx
+            && let Ok(d) = rx.try_recv()
+        {
+            self.usb.disks = Some(d);
+            self.usb.rx = None;
         }
         if let Some(rx) = &self.mt.rx
             && let Ok(f) = rx.try_recv()
@@ -684,6 +705,26 @@ impl ManagerApp {
             Confirm::RestartFirmware => ("Restart into firmware settings?", "Windows restarts immediately into the PC's \
                  firmware settings (BIOS). Save your work first.\n\nTurn Secure Boot off there, then save and exit \
                  (usually F10). Windows starts again afterwards.".into()),
+            Confirm::ReplaceRanges => {
+                let fmt = |v: &[Range]| v.iter().map(|r| format!("  {r}  ({})", report::size(r.len()))).collect::<Vec<_>>().join("\n");
+                let current = sysstatus::load_installed_config().and_then(Result::ok)
+                    .map(|c| range::normalize(&c.ranges).unwrap_or_default()).unwrap_or_default();
+                ("Update the protected ranges?", format!(
+                    "Currently protected:\n{}\n\nNew ranges from the scan:\n{}\n\n\
+                     Shrinking the protected area is only safe if the scan is reliable: weak memory can fail \
+                     only sometimes (for example when the PC is warm). Best scan with 3 or more passes first. \
+                     Errors outside the new ranges would reach Windows.\n\nTakes effect at the next restart.",
+                    fmt(&current), fmt(&self.setup.pending_ranges)))
+            }
+            Confirm::CreateUsb => {
+                let disk = self.selected_usb_disk();
+                ("Erase this USB drive?", match disk {
+                    Some(d) => format!(
+                        "EVERYTHING on this drive will be erased:\n\n  Disk {}: {}  ({})\n\n\
+                         It becomes a BadRAM rescue USB stick.", d.number, d.friendly_name, report::size(d.size)),
+                    None => "The selected drive is no longer available. Refresh the list.".into(),
+                })
+            }
         };
         let mut decision = None;
         egui::Modal::new(egui::Id::unique("badram-confirm")).show(ctx, |ui| {
@@ -733,6 +774,18 @@ impl ManagerApp {
             Confirm::RemoveLimit => self.start_job(ctx, "Remove memory limit", ops::remove_memory_limit),
             Confirm::Restart => self.start_job(ctx, "Restart", ops::restart_now),
             Confirm::RestartFirmware => self.start_job(ctx, "Restart into firmware settings", ops::restart_to_firmware),
+            Confirm::ReplaceRanges => {
+                let ranges = std::mem::take(&mut self.setup.pending_ranges);
+                if !ranges.is_empty() {
+                    self.start_job(ctx, "Update protected ranges", move |log| ops::protect_ranges(&ranges, log));
+                }
+            }
+            Confirm::CreateUsb => {
+                let (Some(disk), Some(efi)) = (self.selected_usb_disk(), self.efi.clone()) else { return };
+                self.usb.erase_ok = false;
+                self.usb.disks = None; // drive letters/partitions change
+                self.start_job(ctx, "Create rescue USB", move |log| ops::create_usb(&disk, &efi, log));
+            }
         }
     }
 
@@ -970,6 +1023,93 @@ impl ManagerApp {
         });
     }
 
+    // -------------------------------------------------------------- USB tool
+
+    fn selected_usb_disk(&self) -> Option<ops::UsbDisk> {
+        let (n, size) = self.usb.selected?;
+        let disks = self.usb.disks.as_ref()?.as_ref().ok()?;
+        disks.iter().find(|d| d.number == n && d.size == size && d.erasable()).cloned()
+    }
+
+    fn refresh_usb(&mut self, ctx: &egui::Context) {
+        if self.usb.rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ops::list_usb_disks());
+            ctx.request_repaint();
+        });
+        self.usb.rx = Some(rx);
+    }
+
+    fn usb_tab(&mut self, ui: &mut egui::Ui) {
+        if self.usb.disks.is_none() && self.usb.rx.is_none() && !self.busy() {
+            self.refresh_usb(ui.ctx());
+        }
+        ui.heading("Rescue USB stick");
+        ui.label(
+            "For a PC that crashes before or while Windows starts because of bad memory. The stick \
+             starts BadRAM first: on its first start it tests all memory and saves the result on the \
+             stick, then it keeps the damaged areas away from Windows and starts Windows. In Windows, \
+             run BadRAM-Manager.exe from the stick to install BadRAM on that PC.",
+        );
+        ui.add_space(6.0);
+        ui.label(RichText::new(
+            "The PC that uses the stick needs Secure Boot turned off, and you open its boot menu \
+             (often F12, F11, F8, Esc or F10 at the maker's logo) to start from the stick.").weak());
+        ui.add_space(10.0);
+
+        ui.horizontal(|ui| {
+            ui.strong("USB drives");
+            if ui.add_enabled(self.usb.rx.is_none() && !self.busy(), egui::Button::new("⟳ Refresh")).clicked() {
+                self.refresh_usb(ui.ctx());
+            }
+            if self.usb.rx.is_some() {
+                ui.spinner();
+            }
+        });
+        match &self.usb.disks {
+            None => {}
+            Some(Err(e)) => {
+                ui.colored_label(level_color(Level::Bad), e);
+            }
+            Some(Ok(disks)) if disks.is_empty() => {
+                ui.label("No USB drive found. Plug one in and press Refresh.");
+            }
+            Some(Ok(disks)) => {
+                for d in disks.clone() {
+                    let text = format!("Disk {}: {}  ({})", d.number, d.friendly_name, report::size(d.size));
+                    if d.erasable() {
+                        ui.radio_value(&mut self.usb.selected, Some((d.number, d.size)), text);
+                    } else {
+                        ui.add_enabled(false, egui::RadioButton::new(false, format!("{text}  (Windows starts from this disk)")));
+                    }
+                }
+            }
+        }
+        ui.add_space(8.0);
+
+        let disk = self.selected_usb_disk();
+        if disk.is_some() {
+            ui.checkbox(&mut self.usb.erase_ok, "I understand that everything on this USB drive will be erased");
+        }
+        if self.efi.is_none() {
+            self.efi_picker(ui);
+        }
+        let can = disk.is_some() && self.usb.erase_ok && self.elevated() && self.efi.is_some() && !self.busy();
+        if ui.add_enabled(can, egui::Button::new(RichText::new("Create rescue USB…").strong())).clicked() {
+            self.confirm = Some(Confirm::CreateUsb);
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label(RichText::new(
+            "The stick gets: EFI\\BOOT\\BOOTX64.EFI (badram.efi in auto mode), EFI\\BOOT\\badram.cfg, \
+             BadRAM-Manager.exe and README.txt. Only a 2 GiB FAT32 partition is created; delete \
+             EFI\\BOOT\\test-result.txt on the stick to test again.").weak());
+    }
+
     // ----------------------------------------------------------------- Setup
 
     fn setup_tab(&mut self, ui: &mut egui::Ui) {
@@ -1085,9 +1225,25 @@ impl ManagerApp {
         ui.add_space(10.0);
 
         // ---- Step 2: find the bad memory
-        let found = result.as_ref().is_some_and(|r| r.completed) || protect_configured;
+        // Started from a rescue USB stick (BadRAM not installed on this PC):
+        // the stick already found and reserved the bad memory.
+        let usb_ranges: Option<Vec<Range>> = match &s.badram {
+            Some(i) if !s.installed() && i.ok && !i.scan_only => Some(i.ranges.clone()),
+            _ => None,
+        };
+        let found = result.as_ref().is_some_and(|r| r.completed) || protect_configured || usb_ranges.is_some();
         step_header(ui, 2, "Find the bad memory", found);
         ui.indent("step2", |ui| {
+            if let Some(r) = &usb_ranges {
+                let total: u64 = r.iter().map(Range::len).sum();
+                check_line(ui, Level::Good, &if r.is_empty() {
+                    "This start used a BadRAM rescue USB stick, which found no bad memory.".to_string()
+                } else {
+                    format!("This start used a BadRAM rescue USB stick, which found and reserved {} in {} range(s).",
+                        report::size(total), r.len())
+                });
+                return;
+            }
             if !prepared && !found {
                 ui.label(RichText::new("Finish step 1 first.").weak());
                 return;
@@ -1159,6 +1315,22 @@ impl ManagerApp {
         let protected_now = verdict == Verdict::Protected;
         step_header(ui, 3, "Protect the bad memory", protect_configured);
         ui.indent("step3", |ui| {
+            if let Some(r) = usb_ranges.as_ref().filter(|r| !r.is_empty()) {
+                ui.label("Install BadRAM on this PC with the ranges the USB stick found, so the stick is no longer needed:");
+                for x in r {
+                    ui.monospace(format!("  {x}  ({})", report::size(x.len())));
+                }
+                let can = prepared && self.efi.is_some() && !busy;
+                let resp = ui.add_enabled(can, egui::Button::new(RichText::new("Install BadRAM with these ranges").strong()));
+                if !prepared {
+                    resp.on_disabled_hover_text("Finish step 1 first.");
+                } else if resp.clicked() {
+                    let ranges = r.clone();
+                    let efi = self.efi.clone().unwrap_or(ops::EfiSource::Embedded);
+                    self.start_job(ui.ctx(), "Install BadRAM", move |log| ops::install_ranges(&ranges, efi, log));
+                }
+                return;
+            }
             if let Some(cfg) = installed_cfg.as_ref().filter(|c| c.mode == Mode::Protect) {
                 let ranges = range::normalize(&cfg.ranges).unwrap_or_default();
                 check_line(ui, Level::Good, &format!("Protecting {} range(s):", ranges.len()));
@@ -1194,9 +1366,17 @@ impl ManagerApp {
                 ui.monospace(format!("  {x}  ({})", report::size(x.len())));
             }
             if covered {
-                // Never nudge towards shrinking a working setup: that needs
-                // more passes and a deliberate choice (Configuration tab).
+                // No prominent nudge towards shrinking a working setup: the
+                // button is secondary and asks for confirmation.
                 check_line(ui, Level::Good, "The protected ranges already cover every error found, plus the margin.");
+                if current != suggested
+                    && ui.add_enabled(s.installed() && !busy, egui::Button::new("Update to these ranges…"))
+                        .on_hover_text("Replace the protected ranges with the scan result. Frees memory, but only safe if the scan is reliable.")
+                        .clicked()
+                {
+                    self.setup.pending_ranges = suggested;
+                    self.confirm = Some(Confirm::ReplaceRanges);
+                }
                 return;
             }
             if protect_configured {
@@ -1283,6 +1463,7 @@ impl eframe::App for ManagerApp {
                 ui.selectable_value(&mut self.tab, Tab::Status, "Status");
                 ui.selectable_value(&mut self.tab, Tab::Config, "Configuration");
                 ui.selectable_value(&mut self.tab, Tab::MemTest, "Memory Test");
+                ui.selectable_value(&mut self.tab, Tab::UsbTool, "USB Tool");
                 ui.selectable_value(&mut self.tab, Tab::Install, "Install / Uninstall");
             });
             ui.add_space(2.0);
@@ -1300,6 +1481,7 @@ impl eframe::App for ManagerApp {
                 Tab::Setup => self.setup_tab(ui),
                 Tab::Config => self.config_tab(ui),
                 Tab::MemTest => self.memtest_tab(ui),
+                Tab::UsbTool => self.usb_tab(ui),
                 Tab::Install => self.install_tab(ui),
             });
         });
