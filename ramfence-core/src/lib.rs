@@ -1,11 +1,11 @@
-//! Pure logic for badram.efi, kept free of any UEFI dependency so it can be
-//! unit-tested on the host (`cargo test -p badram-core`).
+//! Pure logic for ramfence.efi, kept free of any UEFI dependency so it can be
+//! unit-tested on the host (`cargo test -p ramfence-core`).
 //!
-//! - [`config`]: parse `badram.cfg`.
+//! - [`config`]: parse `ramfence.cfg`.
 //! - [`range`]: physical address ranges, outward page alignment, merging.
 //! - [`memmap`]: intersect configured ranges with the firmware memory map,
 //!   decide what to allocate, and verify the result.
-//! - [`status`]: build the `BadRamStatus` variable contents.
+//! - [`status`]: build the `RamFenceStatus` variable contents.
 
 #![cfg_attr(not(test), no_std)]
 

@@ -1,9 +1,9 @@
 //! Pre-boot memory test: request/result file formats and the test engine.
 //!
-//! The GUI writes a request (`test.req`) to the ESP; badram.efi runs the
+//! The GUI writes a request (`test.req`) to the ESP; ramfence.efi runs the
 //! test once before Windows starts and writes `test-result.txt`. The engine
 //! is generic over [`TestMemory`] so it can be unit-tested on the host with
-//! simulated faults, and run by badram.efi on raw physical memory.
+//! simulated faults, and run by ramfence.efi on raw physical memory.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -199,7 +199,7 @@ impl TestResult {
 
     pub fn to_text(&self) -> String {
         let mut s = String::new();
-        let _ = writeln!(s, "badram-test 1");
+        let _ = writeln!(s, "ramfence-test 1");
         let _ = writeln!(s, "result {}", if self.completed { "complete" } else { "aborted" });
         let _ = writeln!(s, "passes {}", self.passes);
         for r in &self.requested {
@@ -232,7 +232,7 @@ impl TestResult {
 /// Parses [`TestResult::to_text`] output. `None` if it is not a result file.
 pub fn parse_result(text: &str) -> Option<TestResult> {
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-    if lines.next()? != "badram-test 1" {
+    if lines.next()? != "ramfence-test 1" {
         return None;
     }
     let mut r = TestResult {
@@ -657,7 +657,7 @@ mod tests {
             errors,
         };
         let text = res.to_text();
-        assert!(text.starts_with("badram-test 1\nresult complete\n"));
+        assert!(text.starts_with("ramfence-test 1\nresult complete\n"));
         assert_eq!(parse_result(&text), Some(res.clone()));
         assert_eq!(res.tested_bytes(), 0x0F00_0000);
         assert_eq!(parse_result("something else"), None);

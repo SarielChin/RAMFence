@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 
-use badram_core::config::parse_address;
-use badram_core::{Config, MemoryType, Mode, OnError, PAGE_SIZE, Range, range};
+use ramfence_core::config::parse_address;
+use ramfence_core::{Config, MemoryType, Mode, OnError, PAGE_SIZE, Range, range};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::ops::{self, InstallOptions, Log};
@@ -124,7 +124,7 @@ impl Editor {
             timeout_secs: self.timeout,
             chainload: (!chainload.is_empty()).then(|| chainload.to_string()),
         };
-        // Round-trip through the same parser badram.efi uses.
+        // Round-trip through the same parser ramfence.efi uses.
         ops::validate_config(&cfg.to_text()).map(|(c, _)| c)
     }
 }
@@ -134,7 +134,7 @@ pub struct ManagerApp {
     status: Option<SystemStatus>,
     status_rx: Option<Receiver<SystemStatus>>,
     editor: Editor,
-    /// badram.efi to install; None until the user picks a file (only when
+    /// ramfence.efi to install; None until the user picks a file (only when
     /// this build has no embedded copy and none was found).
     efi: Option<ops::EfiSource>,
     suspend_bitlocker: bool,
@@ -202,7 +202,7 @@ impl MemTestState {
             text.push_str(&format!("scan {:#x} {:#x}\n", r.start(), r.end()));
         }
         text.push_str(&format!("passes {}\n", self.passes));
-        badram_core::memtest::parse_request(&text).map_err(|e| e.to_string())?;
+        ramfence_core::memtest::parse_request(&text).map_err(|e| e.to_string())?;
         Ok(text)
     }
 }
@@ -429,8 +429,8 @@ impl ManagerApp {
 
         ui.horizontal_wrapped(|ui| {
             let enabled = !self.busy() && s.elevated;
-            if s.badram_first() == Some(false)
-                && ui.add_enabled(enabled, egui::Button::new("Put BadRAM first in boot order")).clicked()
+            if s.ramfence_first() == Some(false)
+                && ui.add_enabled(enabled, egui::Button::new("Put RAMFence first in boot order")).clicked()
             {
                 self.start_job(ui.ctx(), "Fix boot order", ops::fix_boot_order);
             }
@@ -490,10 +490,10 @@ impl ManagerApp {
                 }
             }
             if ui.button("Open file…").clicked()
-                && let Some(p) = rfd::FileDialog::new().add_filter("badram.cfg", &["cfg", "txt"]).pick_file()
+                && let Some(p) = rfd::FileDialog::new().add_filter("ramfence.cfg", &["cfg", "txt"]).pick_file()
             {
                 match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|t| {
-                    badram_core::config::parse(&t).map_err(|e| e.to_string())
+                    ramfence_core::config::parse(&t).map_err(|e| e.to_string())
                 }) {
                     Ok(c) => self.editor.load(&c, p.display().to_string()),
                     Err(e) => self.log.push((LineKind::Error, format!("{}: {e}", p.display()))),
@@ -502,7 +502,7 @@ impl ManagerApp {
             let built = self.editor.build();
             if ui.add_enabled(built.is_ok(), egui::Button::new("Save as…")).clicked()
                 && let Ok(c) = &built
-                && let Some(p) = rfd::FileDialog::new().set_file_name("badram.cfg").save_file()
+                && let Some(p) = rfd::FileDialog::new().set_file_name("ramfence.cfg").save_file()
             {
                 match std::fs::write(&p, ops::config_file_text(c)) {
                     Ok(()) => self.log.push((LineKind::Ok, format!("Saved {}", p.display()))),
@@ -595,17 +595,17 @@ impl ManagerApp {
             }
         }
         if let Ok(c) = &built {
-            egui::CollapsingHeader::new("Preview badram.cfg").show(ui, |ui| {
+            egui::CollapsingHeader::new("Preview ramfence.cfg").show(ui, |ui| {
                 ui.monospace(c.to_text());
             });
         }
         ui.add_space(6.0);
         let can_apply = built.is_ok() && self.installed() && self.elevated() && !self.busy();
-        let resp = ui.add_enabled(can_apply, egui::Button::new("Apply to installed BadRAM…"));
+        let resp = ui.add_enabled(can_apply, egui::Button::new("Apply to installed RAMFence…"));
         let resp = if self.installed() {
-            resp.on_hover_text("Writes badram.cfg to the ESP. Takes effect on the next boot.")
+            resp.on_hover_text("Writes ramfence.cfg to the ESP. Takes effect on the next boot.")
         } else {
-            resp.on_disabled_hover_text("BadRAM is not installed. Use the Install tab.")
+            resp.on_disabled_hover_text("RAMFence is not installed. Use the Install tab.")
         };
         if resp.clicked() {
             self.confirm = Some(Confirm::ApplyConfig);
@@ -626,13 +626,13 @@ impl ManagerApp {
         let bl_on = s.bitlocker.as_deref() == Some("On");
 
         let mut checks: Vec<(Level, &str, String)> = vec![
-            if s.elevated { (Level::Good, "Administrator", "yes".into()) } else { (Level::Bad, "Administrator", "no: restart BadRAM Manager as administrator".into()) },
+            if s.elevated { (Level::Good, "Administrator", "yes".into()) } else { (Level::Bad, "Administrator", "no: restart RAMFence Manager as administrator".into()) },
             match s.uefi { Some(true) => (Level::Good, "Boot mode", "UEFI".into()), Some(false) => (Level::Bad, "Boot mode", "Legacy BIOS (not supported)".into()), None => (Level::Info, "Boot mode", "unknown".into()) },
             match &built { Ok(_) => (Level::Good, "Configuration", "valid (see Configuration tab)".into()), Err(e) => (Level::Bad, "Configuration", e.clone()) },
-            if efi_ok { (Level::Good, "badram.efi", "found".into()) } else { (Level::Bad, "badram.efi", "not found; choose the file below".into()) },
+            if efi_ok { (Level::Good, "ramfence.efi", "found".into()) } else { (Level::Bad, "ramfence.efi", "not found; choose the file below".into()) },
         ];
         checks.push(if sb_on {
-            (if self.allow_secure_boot { Level::Warn } else { Level::Bad }, "Secure Boot", "On: turn it off in the BIOS, or enroll badram.efi's hash in db".into())
+            (if self.allow_secure_boot { Level::Warn } else { Level::Bad }, "Secure Boot", "On: turn it off in the BIOS, or enroll ramfence.efi's hash in db".into())
         } else {
             (Level::Good, "Secure Boot", "Off".into())
         });
@@ -659,7 +659,7 @@ impl ManagerApp {
             ui.checkbox(&mut self.suspend_bitlocker, "Suspend BitLocker for 2 reboots (I have backed up the recovery key)");
         }
         if sb_on {
-            ui.checkbox(&mut self.allow_secure_boot, "Allow Secure Boot (I enrolled this badram.efi's hash in db)");
+            ui.checkbox(&mut self.allow_secure_boot, "Allow Secure Boot (I enrolled this ramfence.efi's hash in db)");
         }
         ui.add_space(8.0);
 
@@ -691,15 +691,15 @@ impl ManagerApp {
                     let r = range::normalize(&c.ranges).unwrap_or_default();
                     format!("{} range(s), {} pages", r.len(), range::total_pages(&r))
                 }).unwrap_or_default();
-                ("Install BadRAM?", format!(
-                    "This changes the firmware boot order so badram.efi starts before Windows.\n\n\
-                     Configuration: {summary}\nbadram.efi: {}\n\nA BCD backup is saved first.", self.efi_label()))
+                ("Install RAMFence?", format!(
+                    "This changes the firmware boot order so ramfence.efi starts before Windows.\n\n\
+                     Configuration: {summary}\nramfence.efi: {}\n\nA BCD backup is saved first.", self.efi_label()))
             }
-            Confirm::Uninstall => ("Uninstall BadRAM?", "Windows Boot Manager is put first again and BadRAM is removed.\n\n\
+            Confirm::Uninstall => ("Uninstall RAMFence?", "Windows Boot Manager is put first again and RAMFence is removed.\n\n\
                  After the next boot Windows CAN use the bad memory again. Restore a memory limit first if needed.".into()),
-            Confirm::ApplyConfig => ("Apply configuration?", "badram.cfg on the ESP is replaced. The new ranges take effect on the next boot.".into()),
+            Confirm::ApplyConfig => ("Apply configuration?", "ramfence.cfg on the ESP is replaced. The new ranges take effect on the next boot.".into()),
             Confirm::RemoveLimit => ("Remove memory limit?", "truncatememory is removed from the running Windows entry, so Windows uses all memory \
-                 badram.efi does not reserve.\n\nOnly do this while BadRAM protection is verified.".into()),
+                 ramfence.efi does not reserve.\n\nOnly do this while RAMFence protection is verified.".into()),
             Confirm::Restart => ("Restart now?", "Windows restarts immediately. Save your work first.\n\n\
                  If a memory scan is scheduled, it runs before Windows starts; press Esc on that screen to stop it.".into()),
             Confirm::RestartFirmware => ("Restart into firmware settings?", "Windows restarts immediately into the PC's \
@@ -721,13 +721,13 @@ impl ManagerApp {
                 ("Erase this USB drive?", match disk {
                     Some(d) => format!(
                         "EVERYTHING on this drive will be erased:\n\n  Disk {}: {}  ({})\n\n\
-                         It becomes a BadRAM rescue USB stick.", d.number, d.friendly_name, report::size(d.size)),
+                         It becomes a RAMFence rescue USB stick.", d.number, d.friendly_name, report::size(d.size)),
                     None => "The selected drive is no longer available. Refresh the list.".into(),
                 })
             }
         };
         let mut decision = None;
-        egui::Modal::new(egui::Id::unique("badram-confirm")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("ramfence-confirm")).show(ctx, |ui| {
             ui.set_max_width(460.0);
             ui.heading(title);
             ui.add_space(6.0);
@@ -796,7 +796,7 @@ impl ManagerApp {
             self.load_test_files(ui.ctx());
         }
         ui.label(
-            "badram.efi can test memory once, before Windows starts, including the reserved bad \
+            "ramfence.efi can test memory once, before Windows starts, including the reserved bad \
              ranges (Windows itself can never reach them). Schedule a test, restart, and the \
              results appear below. It is quick and covers a few passes; MemTest86 remains the \
              thorough reference.",
@@ -842,7 +842,7 @@ impl ManagerApp {
         });
         ui.horizontal(|ui| {
             ui.label("Passes:");
-            ui.add(egui::DragValue::new(&mut self.mt.passes).range(1..=badram_core::memtest::MAX_PASSES));
+            ui.add(egui::DragValue::new(&mut self.mt.passes).range(1..=ramfence_core::memtest::MAX_PASSES));
             ui.label(RichText::new("each pass writes and verifies every word 12 times").weak());
         });
         ui.add_space(6.0);
@@ -856,14 +856,14 @@ impl ManagerApp {
         if unsupported {
             ui.colored_label(
                 level_color(Level::Warn),
-                "⚠ The installed badram.efi is too old to run memory tests. Update the installation \
+                "⚠ The installed ramfence.efi is too old to run memory tests. Update the installation \
                  (Install tab → Update installation) first.",
             );
         }
         let can_act = self.installed() && self.elevated() && !self.busy() && !unsupported;
         ui.horizontal(|ui| {
             let resp = ui.add_enabled(can_act && request.is_ok(), egui::Button::new(RichText::new("Schedule test for next boot").strong()));
-            let resp = if self.installed() { resp } else { resp.on_disabled_hover_text("BadRAM is not installed.") };
+            let resp = if self.installed() { resp } else { resp.on_disabled_hover_text("RAMFence is not installed.") };
             if resp.clicked()
                 && let Ok(text) = request.clone()
             {
@@ -912,7 +912,7 @@ impl ManagerApp {
         }
     }
 
-    fn show_result(&mut self, ui: &mut egui::Ui, r: &badram_core::memtest::TestResult) {
+    fn show_result(&mut self, ui: &mut egui::Ui, r: &ramfence_core::memtest::TestResult) {
         let e = &r.errors;
         // "not in memory map" = not RAM at all (MMIO holes etc.): not a gap
         // in the test.
@@ -994,13 +994,13 @@ impl ManagerApp {
         }
     }
 
-    fn suggested(&self, e: &badram_core::memtest::ErrorLog) -> Vec<Range> {
-        e.suggested_ranges(self.mt.suggest_margin_mib * MIB, MIB, badram_core::memtest::SUGGEST_GAP)
+    fn suggested(&self, e: &ramfence_core::memtest::ErrorLog) -> Vec<Range> {
+        e.suggested_ranges(self.mt.suggest_margin_mib * MIB, MIB, ramfence_core::memtest::SUGGEST_GAP)
     }
 
     fn efi_label(&self) -> String {
         match &self.efi {
-            Some(ops::EfiSource::Embedded) => format!("built-in (bundled with BadRAM Manager {})", env!("CARGO_PKG_VERSION")),
+            Some(ops::EfiSource::Embedded) => format!("built-in (bundled with RAMFence Manager {})", env!("CARGO_PKG_VERSION")),
             Some(ops::EfiSource::File(p)) => p.display().to_string(),
             None => "not selected".into(),
         }
@@ -1008,7 +1008,7 @@ impl ManagerApp {
 
     fn efi_picker(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("badram.efi:");
+            ui.label("ramfence.efi:");
             if paths::EMBEDDED_EFI.is_some() {
                 ui.radio_value(&mut self.efi, Some(ops::EfiSource::Embedded), "built-in");
             }
@@ -1051,9 +1051,9 @@ impl ManagerApp {
         ui.heading("Rescue USB stick");
         ui.label(
             "For a PC that crashes before or while Windows starts because of bad memory. The stick \
-             starts BadRAM first: on its first start it tests all memory and saves the result on the \
+             starts RAMFence first: on its first start it tests all memory and saves the result on the \
              stick, then it keeps the damaged areas away from Windows and starts Windows. In Windows, \
-             run BadRAM-Manager.exe from the stick to install BadRAM on that PC.",
+             run RAMFence-Manager.exe from the stick to install RAMFence on that PC.",
         );
         ui.add_space(6.0);
         ui.label(RichText::new(
@@ -1105,8 +1105,8 @@ impl ManagerApp {
         ui.add_space(10.0);
         ui.separator();
         ui.label(RichText::new(
-            "The stick gets: EFI\\BOOT\\BOOTX64.EFI (badram.efi in auto mode), EFI\\BOOT\\badram.cfg, \
-             BadRAM-Manager.exe and README.txt. Only a 2 GiB FAT32 partition is created; delete \
+            "The stick gets: EFI\\BOOT\\BOOTX64.EFI (ramfence.efi in auto mode), EFI\\BOOT\\ramfence.cfg, \
+             RAMFence-Manager.exe and README.txt. Only a 2 GiB FAT32 partition is created; delete \
              EFI\\BOOT\\test-result.txt on the stick to test again.").weak());
     }
 
@@ -1128,9 +1128,9 @@ impl ManagerApp {
         let pending = files.as_ref().is_some_and(|f| f.pending);
         let result = files.as_ref().and_then(|f| f.result.clone()).and_then(Result::ok);
 
-        ui.heading("Set up BadRAM");
+        ui.heading("Set up RAMFence");
         ui.label(
-            "BadRAM keeps Windows away from damaged memory. Follow the steps in order; each \
+            "RAMFence keeps Windows away from damaged memory. Follow the steps in order; each \
              step checks itself and turns green when it is done.",
         );
         ui.add_space(8.0);
@@ -1142,7 +1142,7 @@ impl ManagerApp {
         step_header(ui, 1, "Prepare this PC", prepared);
         ui.indent("step1", |ui| {
             if !s.elevated {
-                ui.colored_label(level_color(Level::Bad), "BadRAM Manager needs administrator rights.");
+                ui.colored_label(level_color(Level::Bad), "RAMFence Manager needs administrator rights.");
                 if ui.button("Restart as administrator").clicked() && crate::win::relaunch_elevated("") {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1150,7 +1150,7 @@ impl ManagerApp {
             }
             if s.uefi == Some(false) {
                 ui.colored_label(level_color(Level::Bad),
-                    "This PC starts Windows in the old \"legacy BIOS\" mode. BadRAM only works with UEFI, \
+                    "This PC starts Windows in the old \"legacy BIOS\" mode. RAMFence only works with UEFI, \
                      so it cannot be used on this PC.");
                 return;
             }
@@ -1196,13 +1196,13 @@ impl ManagerApp {
             if sb_on {
                 check_line(ui, Level::Bad, "Secure Boot is on and must be turned off.");
                 ui.label(
-                    "badram.efi is not signed by Microsoft, so the PC refuses to start it while Secure Boot \
+                    "ramfence.efi is not signed by Microsoft, so the PC refuses to start it while Secure Boot \
                      is on. Turning it off is done in the PC's firmware settings (often called BIOS):",
                 );
                 ui.label("  1. Click the button below. The PC restarts into its firmware settings.");
                 ui.label("  2. Find \"Secure Boot\" (usually under Security, Boot or Authentication).");
                 ui.label("  3. Set it to Disabled (some PCs: set \"OS Type\" to \"Other OS\").");
-                ui.label("  4. Save and exit (usually F10). Windows starts again; open BadRAM Manager.");
+                ui.label("  4. Save and exit (usually F10). Windows starts again; open RAMFence Manager.");
                 let resp = ui.add_enabled(!bl_on && !busy, egui::Button::new("Restart into firmware settings…"));
                 if bl_on {
                     resp.on_disabled_hover_text("Save the BitLocker recovery key and pause BitLocker first.");
@@ -1214,7 +1214,7 @@ impl ManagerApp {
             }
 
             if s.fast_startup == Some(true) {
-                check_line(ui, Level::Warn, "Fast Startup is on (Windows can then skip BadRAM when starting).");
+                check_line(ui, Level::Warn, "Fast Startup is on (Windows can then skip RAMFence when starting).");
                 if ui.add_enabled(!busy, egui::Button::new("Turn off Fast Startup")).clicked() {
                     self.start_job(ui.ctx(), "Turn off Fast Startup", ops::disable_hibernation);
                 }
@@ -1225,9 +1225,9 @@ impl ManagerApp {
         ui.add_space(10.0);
 
         // ---- Step 2: find the bad memory
-        // Started from a rescue USB stick (BadRAM not installed on this PC):
+        // Started from a rescue USB stick (RAMFence not installed on this PC):
         // the stick already found and reserved the bad memory.
-        let usb_ranges: Option<Vec<Range>> = match &s.badram {
+        let usb_ranges: Option<Vec<Range>> = match &s.ramfence {
             Some(i) if !s.installed() && i.ok && !i.scan_only => Some(i.ranges.clone()),
             _ => None,
         };
@@ -1237,9 +1237,9 @@ impl ManagerApp {
             if let Some(r) = &usb_ranges {
                 let total: u64 = r.iter().map(Range::len).sum();
                 check_line(ui, Level::Good, &if r.is_empty() {
-                    "This start used a BadRAM rescue USB stick, which found no bad memory.".to_string()
+                    "This start used a RAMFence rescue USB stick, which found no bad memory.".to_string()
                 } else {
-                    format!("This start used a BadRAM rescue USB stick, which found and reserved {} in {} range(s).",
+                    format!("This start used a RAMFence rescue USB stick, which found and reserved {} in {} range(s).",
                         report::size(total), r.len())
                 });
                 return;
@@ -1251,8 +1251,8 @@ impl ManagerApp {
             if pending {
                 check_line(ui, Level::Warn, "A memory scan is scheduled for the next restart.");
                 ui.label(
-                    "Restart now. Before Windows starts, BadRAM tests the memory (this takes a few minutes; \
-                     press Esc to stop it), then Windows starts by itself. Open BadRAM Manager again afterwards.",
+                    "Restart now. Before Windows starts, RAMFence tests the memory (this takes a few minutes; \
+                     press Esc to stop it), then Windows starts by itself. Open RAMFence Manager again afterwards.",
                 );
                 if ui.add_enabled(!busy, egui::Button::new(RichText::new("Restart now…").strong())).clicked() {
                     self.confirm = Some(Confirm::Restart);
@@ -1278,13 +1278,13 @@ impl ManagerApp {
                 check_line(ui, Level::Good, "Bad ranges are already configured.");
             } else {
                 ui.label(
-                    "BadRAM can test all memory before Windows starts. This does not change anything \
+                    "RAMFence can test all memory before Windows starts. This does not change anything \
                      yet: it only finds out where the damaged memory is.",
                 );
             }
             ui.horizontal(|ui| {
                 ui.label("Passes:");
-                ui.add(egui::DragValue::new(&mut self.setup.passes).range(1..=badram_core::memtest::MAX_PASSES));
+                ui.add(egui::DragValue::new(&mut self.setup.passes).range(1..=ramfence_core::memtest::MAX_PASSES));
                 ui.label(RichText::new("1 is quick; 3+ finds weak memory more reliably").weak());
             });
             let label = if result.is_some() { "Scan again at next restart" } else { "Scan all memory at next restart" };
@@ -1316,18 +1316,18 @@ impl ManagerApp {
         step_header(ui, 3, "Protect the bad memory", protect_configured);
         ui.indent("step3", |ui| {
             if let Some(r) = usb_ranges.as_ref().filter(|r| !r.is_empty()) {
-                ui.label("Install BadRAM on this PC with the ranges the USB stick found, so the stick is no longer needed:");
+                ui.label("Install RAMFence on this PC with the ranges the USB stick found, so the stick is no longer needed:");
                 for x in r {
                     ui.monospace(format!("  {x}  ({})", report::size(x.len())));
                 }
                 let can = prepared && self.efi.is_some() && !busy;
-                let resp = ui.add_enabled(can, egui::Button::new(RichText::new("Install BadRAM with these ranges").strong()));
+                let resp = ui.add_enabled(can, egui::Button::new(RichText::new("Install RAMFence with these ranges").strong()));
                 if !prepared {
                     resp.on_disabled_hover_text("Finish step 1 first.");
                 } else if resp.clicked() {
                     let ranges = r.clone();
                     let efi = self.efi.clone().unwrap_or(ops::EfiSource::Embedded);
-                    self.start_job(ui.ctx(), "Install BadRAM", move |log| ops::install_ranges(&ranges, efi, log));
+                    self.start_job(ui.ctx(), "Install RAMFence", move |log| ops::install_ranges(&ranges, efi, log));
                 }
                 return;
             }
@@ -1360,7 +1360,7 @@ impl ManagerApp {
             ui.label(if covered {
                 format!("The errors found, plus the margin, span {} in {} range(s):", report::size(total), suggested.len())
             } else {
-                format!("BadRAM will reserve {} in {} range(s):", report::size(total), suggested.len())
+                format!("RAMFence will reserve {} in {} range(s):", report::size(total), suggested.len())
             });
             for x in &suggested {
                 ui.monospace(format!("  {x}  ({})", report::size(x.len())));
@@ -1393,7 +1393,7 @@ impl ManagerApp {
         step_header(ui, 4, "Check that it works", protected_now);
         ui.indent("step4", |ui| {
             if protected_now {
-                let pages = s.badram.as_ref().map_or(0, |i| i.pages);
+                let pages = s.ramfence.as_ref().map_or(0, |i| i.pages);
                 check_line(ui, Level::Good, &format!(
                     "Done. {} of damaged memory was reserved before Windows started, and Windows does not use it.",
                     report::size(pages * PAGE_SIZE)));
@@ -1408,7 +1408,7 @@ impl ManagerApp {
                     "Later: if a message says this start was not protected, restart as it asks. After a BIOS \
                      update or a memory change, scan again.").weak());
             } else if protect_configured {
-                ui.label("Restart to switch the protection on, then open BadRAM Manager again to check.");
+                ui.label("Restart to switch the protection on, then open RAMFence Manager again to check.");
                 if ui.add_enabled(!busy, egui::Button::new("Restart now…")).clicked() {
                     self.confirm = Some(Confirm::Restart);
                 }
@@ -1450,7 +1450,7 @@ impl eframe::App for ManagerApp {
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("BadRAM Manager");
+                ui.heading("RAMFence Manager");
                 if !self.elevated() && self.status.is_some() {
                     ui.colored_label(level_color(Level::Warn), "⚠ not running as administrator");
                     if ui.small_button("Restart as administrator").clicked() && crate::win::relaunch_elevated("") {
@@ -1506,13 +1506,13 @@ fn check_line(ui: &mut egui::Ui, level: Level, text: &str) {
     });
 }
 
-fn is_not_ram(u: &badram_core::memtest::Untested) -> bool {
+fn is_not_ram(u: &ramfence_core::memtest::Untested) -> bool {
     u.reason == "not in memory map"
 }
 
 /// Error histogram over the requested span, with tested/untested strips and
 /// the configured bad ranges shaded.
-fn histogram(ui: &mut egui::Ui, r: &badram_core::memtest::TestResult, protected: &[Range]) {
+fn histogram(ui: &mut egui::Ui, r: &ramfence_core::memtest::TestResult, protected: &[Range]) {
     let (Some(lo), Some(hi)) = (
         r.requested.iter().map(Range::start).min(),
         r.requested.iter().map(Range::end).max(),
@@ -1541,7 +1541,7 @@ fn histogram(ui: &mut egui::Ui, r: &badram_core::memtest::TestResult, protected:
     let usable = rect.height() - 12.0;
     for (&b, &n) in &r.errors.buckets {
         let h = (n as f32).sqrt() / max.sqrt() * usable;
-        let end = b + badram_core::memtest::BUCKET_SIZE;
+        let end = b + ramfence_core::memtest::BUCKET_SIZE;
         p.rect_filled(band(b, end, bottom - 8.0 - h, bottom - 8.0), 0.0, level_color(Level::Bad));
     }
     ui.horizontal(|ui| {

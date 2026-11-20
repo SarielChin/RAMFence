@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["badram-core", "badram-efi", "badram-manager"]
+members = ["ramfence-core", "ramfence-efi", "ramfence-manager"]
 
 [workspace.package]
 edition = "2024"

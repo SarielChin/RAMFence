@@ -1,4 +1,4 @@
-//! Contents of the volatile `BadRamStatus` UEFI variable (DESIGN.md §2.5).
+//! Contents of the volatile `RamFenceStatus` UEFI variable (DESIGN.md §2.5).
 //!
 //! Format (ASCII, `;`-separated `key=value`):
 //!
@@ -50,7 +50,7 @@ pub fn format_status(
     s
 }
 
-/// Parsed contents of `BadRamStatus`.
+/// Parsed contents of `RamFenceStatus`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusInfo {
     pub version: u32,
@@ -59,7 +59,7 @@ pub struct StatusInfo {
     pub pages: u64,
     /// `None` if the type field is missing or unknown.
     pub memory_type: Option<MemoryType>,
-    /// badram.efi ran in scan-only mode and reserved nothing on purpose.
+    /// ramfence.efi ran in scan-only mode and reserved nothing on purpose.
     pub scan_only: bool,
     pub error: Option<String>,
 }

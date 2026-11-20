@@ -3,18 +3,18 @@
 
 Set-StrictMode -Version 3.0
 
-# Must match STATUS_VENDOR in badram-efi/src/main.rs.
-$script:BadRamVendorGuid = '{5B7C3F1E-9A42-4D8E-B6A1-2F0C8E4D7A93}'
-$script:BadRamVariable = 'BadRamStatus'
-$script:BadRamEntryName = 'BadRAM'
-$script:BadRamEspDir = '\EFI\badram'
-$script:BadRamEfiPath = '\EFI\badram\badram.efi'
+# Must match STATUS_VENDOR in ramfence-efi/src/main.rs.
+$script:RamFenceVendorGuid = '{0B0C86EE-7039-477B-9A53-E39345EF90D5}'
+$script:RamFenceVariable = 'RamFenceStatus'
+$script:RamFenceEntryName = 'RAMFence'
+$script:RamFenceEspDir = '\EFI\ramfence'
+$script:RamFenceEfiPath = '\EFI\ramfence\ramfence.efi'
 # Program Files is writable only by administrators, which matters because
 # check.ps1 runs elevated from a scheduled task.
-$script:BadRamInstallDir = Join-Path $env:ProgramFiles 'BadRAM'
-$script:BadRamStateFile = Join-Path $script:BadRamInstallDir 'state.json'
-$script:BadRamLogFile = Join-Path $script:BadRamInstallDir 'check.log'
-$script:BadRamTaskName = 'BadRAM boot check'
+$script:RamFenceInstallDir = Join-Path $env:ProgramFiles 'RAMFence'
+$script:RamFenceStateFile = Join-Path $script:RamFenceInstallDir 'state.json'
+$script:RamFenceLogFile = Join-Path $script:RamFenceInstallDir 'check.log'
+$script:RamFenceTaskName = 'RAMFence boot check'
 
 function Assert-Admin {
     $p = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -26,7 +26,7 @@ function Assert-Admin {
 function Assert-UefiBoot {
     # Windows sets %firmware_type% to UEFI, Legacy or Unknown.
     if ($env:firmware_type -ne 'UEFI') {
-        throw "Windows was not booted in UEFI mode (firmware_type=$env:firmware_type); badram.efi cannot be used."
+        throw "Windows was not booted in UEFI mode (firmware_type=$env:firmware_type); ramfence.efi cannot be used."
     }
 }
 
@@ -73,7 +73,7 @@ function Test-BcdEntry([string]$Id) {
     $LASTEXITCODE -eq 0
 }
 
-function Set-BadRamFirst([string]$Id) {
+function Set-RamFenceFirst([string]$Id) {
     Invoke-Bcdedit /set '{fwbootmgr}' displayorder $Id /addfirst | Out-Null
 }
 
@@ -99,7 +99,7 @@ function Invoke-WithEsp([scriptblock]$Action) {
     }
 }
 
-# --- BadRamStatus variable -------------------------------------------------------
+# --- RamFenceStatus variable -------------------------------------------------------
 
 $script:FirmwareApiLoaded = $false
 function Initialize-FirmwareApi {
@@ -108,7 +108,7 @@ function Initialize-FirmwareApi {
 using System;
 using System.Runtime.InteropServices;
 
-public static class BadRamFirmware {
+public static class RamFenceFirmware {
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern uint GetFirmwareEnvironmentVariableExW(
         string name, string guid, byte[] buffer, uint size, out uint attributes);
@@ -166,22 +166,22 @@ public static class BadRamFirmware {
 
 # Returns @{ Present = $bool; Raw = 'text'; Fields = @{...} }.
 # Throws on errors other than "variable not found".
-function Get-BadRamStatus {
+function Get-RamFenceStatus {
     Initialize-FirmwareApi
-    $e = [BadRamFirmware]::EnableSystemEnvironmentPrivilege()
+    $e = [RamFenceFirmware]::EnableSystemEnvironmentPrivilege()
     if ($e -ne 0) { throw "Cannot enable SeSystemEnvironmentPrivilege (Win32 error $e). Run as Administrator." }
     $err = 0
-    $data = [BadRamFirmware]::Read($script:BadRamVariable, $script:BadRamVendorGuid, [ref]$err)
+    $data = [RamFenceFirmware]::Read($script:RamFenceVariable, $script:RamFenceVendorGuid, [ref]$err)
     if ($null -eq $data) {
         if ($err -eq 203) { return @{ Present = $false; Raw = ''; Fields = @{} } }  # ERROR_ENVVAR_NOT_FOUND
-        throw "Reading firmware variable $($script:BadRamVariable) failed (Win32 error $err)."
+        throw "Reading firmware variable $($script:RamFenceVariable) failed (Win32 error $err)."
     }
     $raw = [Text.Encoding]::ASCII.GetString($data)
-    @{ Present = $true; Raw = $raw; Fields = (ConvertFrom-BadRamStatus $raw) }
+    @{ Present = $true; Raw = $raw; Fields = (ConvertFrom-RamFenceStatus $raw) }
 }
 
 # "version=1;ok=1;ranges=...;pages=N;type=unusable[;error=...]" -> hashtable
-function ConvertFrom-BadRamStatus([string]$Text) {
+function ConvertFrom-RamFenceStatus([string]$Text) {
     $h = @{}
     foreach ($part in $Text.TrimEnd([char]0).Split(';')) {
         $i = $part.IndexOf('=')
@@ -192,21 +192,21 @@ function ConvertFrom-BadRamStatus([string]$Text) {
 
 # --- state -----------------------------------------------------------------------
 
-function Get-BadRamState {
-    if (-not (Test-Path $script:BadRamStateFile)) { return $null }
-    Get-Content -Raw $script:BadRamStateFile | ConvertFrom-Json
+function Get-RamFenceState {
+    if (-not (Test-Path $script:RamFenceStateFile)) { return $null }
+    Get-Content -Raw $script:RamFenceStateFile | ConvertFrom-Json
 }
 
-function Save-BadRamState([string]$Id) {
+function Save-RamFenceState([string]$Id) {
     @{ EntryId = $Id; InstalledAt = (Get-Date).ToString('s') } |
-        ConvertTo-Json | Set-Content -Encoding UTF8 $script:BadRamStateFile
+        ConvertTo-Json | Set-Content -Encoding UTF8 $script:RamFenceStateFile
 }
 
 # --- config validation -----------------------------------------------------------
 
-# Light check mirroring badram-core's parser, so obvious mistakes are caught
-# before rebooting. The real parser in badram.efi remains authoritative.
-function Test-BadRamConfig([string]$Path) {
+# Light check mirroring ramfence-core's parser, so obvious mistakes are caught
+# before rebooting. The real parser in ramfence.efi remains authoritative.
+function Test-RamFenceConfig([string]$Path) {
     $errors = @()
     $ranges = 0
     $mode = 'protect'

@@ -389,31 +389,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "badram-core"
-version = "0.1.0"
-
-[[package]]
-name = "badram-efi"
-version = "0.4.0"
-dependencies = [
- "badram-core",
- "uefi",
-]
-
-[[package]]
-name = "badram-manager"
-version = "0.4.0"
-dependencies = [
- "badram-core",
- "eframe",
- "rfd",
- "serde",
- "serde_json",
- "windows-sys 0.61.2",
- "winit",
-]
-
-[[package]]
 name = "bit_field"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2202,6 +2177,31 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "ramfence-core"
+version = "0.1.0"
+
+[[package]]
+name = "ramfence-efi"
+version = "0.5.0"
+dependencies = [
+ "ramfence-core",
+ "uefi",
+]
+
+[[package]]
+name = "ramfence-manager"
+version = "0.5.0"
+dependencies = [
+ "eframe",
+ "ramfence-core",
+ "rfd",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+ "winit",
+]
 
 [[package]]
 name = "raw-window-handle"

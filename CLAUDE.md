@@ -5,16 +5,16 @@ UEFI 開機前程式（Rust），在 Windows Boot Manager 啟動前把設定的�
 ## 指令
 
 - 安裝 target：`rustup target add x86_64-unknown-uefi`
-- 建置：`cargo build -p badram-efi --target x86_64-unknown-uefi --release`
-- 測試純邏輯：`cargo test -p badram-core`
-- GUI 管理工具：`cargo build -p badram-manager --release`（Windows GNU toolchain 需要 MinGW-w64 的 `dlltool`、`as` 在 PATH；測試：`cargo test -p badram-manager`）
-  - `badram-manager.exe --status` 印出狀態報告；`--check` 是登入排程用的無視窗檢查
-  - 發行單一檔案：`tools\build-release.ps1` → `dist\BadRAM-Manager-<版本>.exe`（build.rs 會把 badram.efi 嵌入 exe，所以要先建 EFI）
+- 建置：`cargo build -p ramfence-efi --target x86_64-unknown-uefi --release`
+- 測試純邏輯：`cargo test -p ramfence-core`
+- GUI 管理工具：`cargo build -p ramfence-manager --release`（Windows GNU toolchain 需要 MinGW-w64 的 `dlltool`、`as` 在 PATH；測試：`cargo test -p ramfence-manager`）
+  - `ramfence-manager.exe --status` 印出狀態報告；`--check` 是登入排程用的無視窗檢查
+  - 發行單一檔案：`tools\build-release.ps1` → `dist\RAMFence-Manager-<版本>.exe`（build.rs 會把 ramfence.efi 嵌入 exe，所以要先建 EFI）
 - QEMU 測試：需要 OVMF（見 DESIGN.md §7）
 
 ## 規則
 
-- `badram-core` 保持 `no_std`、不依賴 `uefi` crate，所有可測的邏輯放這裡。
+- `ramfence-core` 保持 `no_std`、不依賴 `uefi` crate，所有可測的邏輯放這裡。
 - 申請記憶體只能用 `EfiUnusableMemory` 或 `EfiReservedMemoryType`，絕不能用會在 ExitBootServices 後被回收的類型。
 - 任何錯誤都不能讓程式默默繼續：一律依 `on_error` 處理並在畫面顯示。
 - 提交到 git 的檔案（程式碼註解、README、commit message 等）不可包含機器專屬資訊：電腦型號、硬體配置、實際壞區位址、主機名稱、本機路徑。這些只放 `CLAUDE.local.md`。

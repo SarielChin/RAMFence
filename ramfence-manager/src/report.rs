@@ -1,7 +1,7 @@
 //! Human-readable rows for a [`SystemStatus`], shared by the Status tab and
 //! the `--status` text output.
 
-use badram_core::PAGE_SIZE;
+use ramfence_core::PAGE_SIZE;
 
 use crate::sysstatus::{SystemStatus, Verdict};
 
@@ -50,7 +50,7 @@ pub fn size(bytes: u64) -> String {
 pub fn headline(s: &SystemStatus) -> (Level, String) {
     match s.verdict() {
         Verdict::Protected => {
-            let pages = s.badram.as_ref().map_or(0, |i| i.pages);
+            let pages = s.ramfence.as_ref().map_or(0, |i| i.pages);
             (
                 Level::Good,
                 format!(
@@ -62,15 +62,15 @@ pub fn headline(s: &SystemStatus) -> (Level, String) {
         }
         Verdict::NotProtected => (
             Level::Bad,
-            "NOT protected: this boot did not go through badram.efi. Restart (and check the boot order)."
+            "NOT protected: this boot did not go through ramfence.efi. Restart (and check the boot order)."
                 .into(),
         ),
         Verdict::Problem(p) => (Level::Bad, p),
         Verdict::ScanOnly => (
             Level::Warn,
-            "Scan-only mode: BadRAM can test memory but protects nothing yet. Finish the Setup tab.".into(),
+            "Scan-only mode: RAMFence can test memory but protects nothing yet. Finish the Setup tab.".into(),
         ),
-        Verdict::NotInstalled => (Level::Info, "BadRAM is not installed.".into()),
+        Verdict::NotInstalled => (Level::Info, "RAMFence is not installed.".into()),
         Verdict::Unknown(u) => (Level::Warn, format!("Status unknown: {u}")),
     }
 }
@@ -94,7 +94,7 @@ pub fn rows(s: &SystemStatus) -> Vec<Row> {
     v.push(row("Boot mode", l, t));
     let (l, t) = yes_no(
         s.secure_boot,
-        (Level::Warn, "On (unsigned badram.efi is refused unless its hash is enrolled)"),
+        (Level::Warn, "On (unsigned ramfence.efi is refused unless its hash is enrolled)"),
         (Level::Good, "Off"),
     );
     v.push(row("Secure Boot", l, t));
@@ -105,7 +105,7 @@ pub fn rows(s: &SystemStatus) -> Vec<Row> {
     });
     let (l, t) = yes_no(
         s.fast_startup,
-        (Level::Warn, "On (a resume from hibernation skips badram.efi)"),
+        (Level::Warn, "On (a resume from hibernation skips ramfence.efi)"),
         (Level::Good, "Off"),
     );
     v.push(row("Fast Startup", l, t));
@@ -119,12 +119,12 @@ pub fn rows(s: &SystemStatus) -> Vec<Row> {
                 (Level::Bad, &format!("{} is missing; install again", st.entry_id)),
             );
             v.push(row("Boot entry", l, t));
-            v.push(match (&s.boot_order, s.badram_first()) {
-                (_, Some(true)) => row("Boot order", Level::Good, "BadRAM is first"),
+            v.push(match (&s.boot_order, s.ramfence_first()) {
+                (_, Some(true)) => row("Boot order", Level::Good, "RAMFence is first"),
                 (Ok(o), Some(false)) => row(
                     "Boot order",
                     Level::Bad,
-                    format!("BadRAM is not first (first: {})", o.first().map_or("none", |x| x)),
+                    format!("RAMFence is not first (first: {})", o.first().map_or("none", |x| x)),
                 ),
                 (Err(e), _) => row("Boot order", Level::Info, e.clone()),
                 _ => row("Boot order", Level::Info, "unknown"),
@@ -138,10 +138,10 @@ pub fn rows(s: &SystemStatus) -> Vec<Row> {
         None => v.push(row("Installed", Level::Info, "no")),
     }
 
-    v.push(match &s.badram_raw {
+    v.push(match &s.ramfence_raw {
         Ok(Some(raw)) => row(
-            "BadRamStatus",
-            match &s.badram {
+            "RamFenceStatus",
+            match &s.ramfence {
                 Some(i) if i.ok && i.scan_only => Level::Warn,
                 Some(i) if i.ok => Level::Good,
                 _ => Level::Bad,
@@ -149,11 +149,11 @@ pub fn rows(s: &SystemStatus) -> Vec<Row> {
             raw.clone(),
         ),
         Ok(None) => row(
-            "BadRamStatus",
+            "RamFenceStatus",
             if s.installed() { Level::Bad } else { Level::Info },
-            "missing (this boot did not go through badram.efi)",
+            "missing (this boot did not go through ramfence.efi)",
         ),
-        Err(e) => row("BadRamStatus", Level::Info, e.clone()),
+        Err(e) => row("RamFenceStatus", Level::Info, e.clone()),
     });
 
     if let (Some(inst), Some(vis)) = (s.installed_mem, s.visible_mem) {

@@ -1,10 +1,10 @@
-//! BadRAM Manager: install, configure, check and uninstall badram.efi.
+//! RAMFence Manager: install, configure, check and uninstall ramfence.efi.
 //!
 //! Usage:
-//!   badram-manager              GUI (asks for elevation)
-//!   badram-manager --no-elevate GUI without the UAC prompt (read-only checks)
-//!   badram-manager --check      headless logon check (scheduled task)
-//!   badram-manager --status     print the status report to the console
+//!   ramfence-manager              GUI (asks for elevation)
+//!   ramfence-manager --no-elevate GUI without the UAC prompt (read-only checks)
+//!   ramfence-manager --check      headless logon check (scheduled task)
+//!   ramfence-manager --status     print the status report to the console
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -53,16 +53,16 @@ fn main() {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("BadRAM Manager")
+            .with_title("RAMFence Manager")
             .with_inner_size([860.0, 720.0])
             .with_min_inner_size([640.0, 480.0]),
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(
-        "BadRAM Manager",
+        "RAMFence Manager",
         options,
         Box::new(|cc| Ok(Box::new(app::ManagerApp::new(cc)))),
     ) {
-        win::message_box("BadRAM Manager", &format!("Cannot start the window: {e}"), win::Icon::Error);
+        win::message_box("RAMFence Manager", &format!("Cannot start the window: {e}"), win::Icon::Error);
     }
 }

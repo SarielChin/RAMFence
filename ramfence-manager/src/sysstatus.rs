@@ -1,8 +1,8 @@
 //! Collects everything the Status tab and `--check` need. Every probe is
 //! independent; failures are recorded instead of aborting.
 
-use badram_core::status::{StatusInfo, parse_status};
-use badram_core::{Config, Range, config, range};
+use ramfence_core::status::{StatusInfo, parse_status};
+use ramfence_core::{Config, Range, config, range};
 
 use crate::paths::{STATUS_VARIABLE, STATUS_VENDOR_GUID, installed_cfg};
 use crate::state::{self, State};
@@ -21,9 +21,9 @@ pub struct SystemStatus {
     pub state: Option<State>,
     pub entry_exists: Option<bool>,
     pub boot_order: Result<Vec<String>, String>,
-    /// Raw BadRamStatus text; Ok(None) = variable missing (boot not protected).
-    pub badram_raw: Result<Option<String>, String>,
-    pub badram: Option<StatusInfo>,
+    /// Raw RamFenceStatus text; Ok(None) = variable missing (boot not protected).
+    pub ramfence_raw: Result<Option<String>, String>,
+    pub ramfence: Option<StatusInfo>,
     pub windows_ranges: Result<Vec<Range>, String>,
     pub installed_config: Option<Result<Config, String>>,
     pub truncatememory: Result<Option<String>, String>,
@@ -32,13 +32,13 @@ pub struct SystemStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// badram.efi ran with ok=1 and Windows uses none of the ranges.
+    /// ramfence.efi ran with ok=1 and Windows uses none of the ranges.
     Protected,
-    /// badram.efi ran but reported an error, or Windows uses bad memory.
+    /// ramfence.efi ran but reported an error, or Windows uses bad memory.
     Problem(String),
-    /// This boot did not go through badram.efi.
+    /// This boot did not go through ramfence.efi.
     NotProtected,
-    /// badram.efi ran in scan-only mode (first-time setup): nothing is
+    /// ramfence.efi ran in scan-only mode (first-time setup): nothing is
     /// reserved yet, on purpose.
     ScanOnly,
     NotInstalled,
@@ -50,9 +50,9 @@ impl SystemStatus {
         self.state.is_some()
     }
 
-    /// Ranges badram.efi reported, else the installed config's ranges.
+    /// Ranges ramfence.efi reported, else the installed config's ranges.
     pub fn protected_ranges(&self) -> Vec<Range> {
-        if let Some(info) = &self.badram {
+        if let Some(info) = &self.ramfence {
             return info.ranges.clone();
         }
         match &self.installed_config {
@@ -67,7 +67,7 @@ impl SystemStatus {
         Some(physmem::overlaps(win, &self.protected_ranges()))
     }
 
-    pub fn badram_first(&self) -> Option<bool> {
+    pub fn ramfence_first(&self) -> Option<bool> {
         let id = &self.state.as_ref()?.entry_id;
         let order = self.boot_order.as_ref().ok()?;
         Some(order.first() == Some(id))
@@ -83,14 +83,14 @@ impl SystemStatus {
             let list: Vec<String> = o.iter().map(|r| r.to_string()).collect();
             return Verdict::Problem(format!("Windows is using protected memory: {}", list.join(", ")));
         }
-        match (&self.badram_raw, &self.badram) {
+        match (&self.ramfence_raw, &self.ramfence) {
             (Err(e), _) => Verdict::Unknown(e.clone()),
             (Ok(None), _) if !self.installed() => Verdict::NotInstalled,
             (Ok(None), _) => Verdict::NotProtected,
-            (Ok(Some(raw)), None) => Verdict::Problem(format!("unreadable BadRamStatus: {raw}")),
+            (Ok(Some(raw)), None) => Verdict::Problem(format!("unreadable RamFenceStatus: {raw}")),
             (Ok(Some(_)), Some(info)) if info.ok && info.scan_only => Verdict::ScanOnly,
             (Ok(Some(_)), Some(info)) if !info.ok => Verdict::Problem(format!(
-                "badram.efi reported an error: {}",
+                "ramfence.efi reported an error: {}",
                 info.error.as_deref().unwrap_or("(no details)")
             )),
             (Ok(Some(_)), Some(_)) => Verdict::Protected,
@@ -123,7 +123,7 @@ fn fast_startup() -> Option<bool> {
     Some(hiberboot == 1 && hibernate == 1)
 }
 
-pub fn read_badram_status() -> Result<Option<String>, String> {
+pub fn read_ramfence_status() -> Result<Option<String>, String> {
     Ok(win::read_firmware_variable(STATUS_VARIABLE, STATUS_VENDOR_GUID)?
         .map(|b| String::from_utf8_lossy(&b).trim_end_matches('\0').to_string()))
 }
@@ -137,12 +137,12 @@ pub fn collect() -> SystemStatus {
     let elevated = win::is_elevated();
     let (installed_mem, visible_mem) = win::memory_totals();
     let state = state::load();
-    let badram_raw = if elevated {
-        read_badram_status()
+    let ramfence_raw = if elevated {
+        read_ramfence_status()
     } else {
         Err("administrator rights needed".into())
     };
-    let badram = badram_raw.as_ref().ok().and_then(|o| o.as_deref()).and_then(parse_status);
+    let ramfence = ramfence_raw.as_ref().ok().and_then(|o| o.as_deref()).and_then(parse_status);
     fn need_admin<T>() -> Result<T, String> {
         Err("administrator rights needed".into())
     }
@@ -164,8 +164,8 @@ pub fn collect() -> SystemStatus {
         },
         state,
         boot_order: if elevated { bcd::firmware_boot_order() } else { need_admin() },
-        badram_raw,
-        badram,
+        ramfence_raw,
+        ramfence,
         windows_ranges: physmem::windows_ranges(),
         installed_config: load_installed_config(),
         truncatememory: if elevated { bcd::current_truncatememory() } else { need_admin() },
@@ -189,8 +189,8 @@ mod tests {
             state: Some(State { entry_id: "{e}".into(), installed_at: String::new() }),
             entry_exists: Some(true),
             boot_order: Ok(vec!["{e}".into(), "{w}".into()]),
-            badram_raw: Ok(Some("version=1;ok=1;ranges=0x10000-0x20000;pages=16;type=unusable".into())),
-            badram: parse_status("version=1;ok=1;ranges=0x10000-0x20000;pages=16;type=unusable"),
+            ramfence_raw: Ok(Some("version=1;ok=1;ranges=0x10000-0x20000;pages=16;type=unusable".into())),
+            ramfence: parse_status("version=1;ok=1;ranges=0x10000-0x20000;pages=16;type=unusable"),
             windows_ranges: Ok(vec![Range::new(0x1000, 0x10000).unwrap(), Range::new(0x20000, 0x90000).unwrap()]),
             installed_config: None,
             truncatememory: Ok(None),
@@ -202,11 +202,11 @@ mod tests {
     fn verdicts() {
         let s = base();
         assert_eq!(s.verdict(), Verdict::Protected);
-        assert_eq!(s.badram_first(), Some(true));
+        assert_eq!(s.ramfence_first(), Some(true));
 
         let mut s = base();
-        s.badram_raw = Ok(None);
-        s.badram = None;
+        s.ramfence_raw = Ok(None);
+        s.ramfence = None;
         assert_eq!(s.verdict(), Verdict::NotProtected);
         s.state = None;
         assert_eq!(s.verdict(), Verdict::NotInstalled);
@@ -216,19 +216,19 @@ mod tests {
         assert!(matches!(s.verdict(), Verdict::Problem(_)));
 
         let mut s = base();
-        s.badram = parse_status("version=1;ok=0;ranges=;pages=0;type=unusable;error=boom");
-        assert_eq!(s.verdict(), Verdict::Problem("badram.efi reported an error: boom".into()));
+        s.ramfence = parse_status("version=1;ok=0;ranges=;pages=0;type=unusable;error=boom");
+        assert_eq!(s.verdict(), Verdict::Problem("ramfence.efi reported an error: boom".into()));
 
         let mut s = base();
         s.boot_order = Ok(vec!["{w}".into(), "{e}".into()]);
-        assert_eq!(s.badram_first(), Some(false));
+        assert_eq!(s.ramfence_first(), Some(false));
 
         let mut s = base();
         s.elevated = false;
         assert!(matches!(s.verdict(), Verdict::Unknown(_)));
 
         let mut s = base();
-        s.badram = parse_status("version=1;ok=1;ranges=;pages=0;type=unusable;mode=scan-only");
+        s.ramfence = parse_status("version=1;ok=1;ranges=;pages=0;type=unusable;mode=scan-only");
         assert_eq!(s.verdict(), Verdict::ScanOnly);
     }
 }

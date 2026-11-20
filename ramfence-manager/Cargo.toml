@@ -1,16 +1,16 @@
 [package]
-name = "badram-manager"
-version = "0.4.0"
+name = "ramfence-manager"
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
-description = "Windows GUI to install, configure, check and uninstall badram.efi."
+description = "Windows GUI to install, configure, check and uninstall ramfence.efi."
 
 [[bin]]
-name = "badram-manager"
+name = "ramfence-manager"
 path = "src/main.rs"
 
 [dependencies]
-badram-core = { path = "../badram-core" }
+ramfence-core = { path = "../ramfence-core" }
 # glow (OpenGL) only: much smaller than the default wgpu backend.
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "accesskit", "clipboard"] }
 # eframe's default features enable winit's defaults; keep them on Windows.

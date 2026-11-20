@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use badram_core::{Config, Range, config, memtest, range};
+use ramfence_core::{Config, Range, config, memtest, range};
 
 use crate::paths::{self, CFG_NAME, EFI_NAME, ENTRY_DESCRIPTION, ESP_DIR, ESP_EFI_PATH, EXE_NAME};
 use crate::state::{self, State};
@@ -15,7 +15,7 @@ use crate::{bcd, esp, task};
 
 pub type Log<'a> = &'a mut dyn FnMut(String);
 
-/// Parses and normalizes config text exactly like badram.efi does.
+/// Parses and normalizes config text exactly like ramfence.efi does.
 pub fn validate_config(text: &str) -> Result<(Config, Vec<Range>), String> {
     let cfg = config::parse(text).map_err(|e| e.to_string())?;
     let ranges = range::normalize(&cfg.ranges).map_err(|e| e.to_string())?;
@@ -25,7 +25,7 @@ pub fn validate_config(text: &str) -> Result<(Config, Vec<Range>), String> {
 /// Text written to disk: a header comment plus the canonical config.
 pub fn config_file_text(cfg: &Config) -> String {
     format!(
-        "# badram.cfg, written by BadRAM Manager {}\n{}",
+        "# ramfence.cfg, written by RAMFence Manager {}\n{}",
         win::local_timestamp(),
         cfg.to_text()
     )
@@ -44,7 +44,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Copies unless `from` and `to` are the same file (e.g. reinstalling the
-/// already-installed badram.efi).
+/// already-installed ramfence.efi).
 fn copy(from: &Path, to: &Path) -> Result<(), String> {
     if same_file(from, to) {
         return Ok(());
@@ -62,7 +62,7 @@ fn write_bytes(to: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::write(to, bytes).map_err(|e| format!("cannot write {}: {e}", to.display()))
 }
 
-/// Where the badram.efi to install comes from.
+/// Where the ramfence.efi to install comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EfiSource {
     /// The copy bundled into this executable.
@@ -71,7 +71,7 @@ pub enum EfiSource {
 }
 
 impl EfiSource {
-    /// The default: the bundled copy, else a badram.efi found on disk.
+    /// The default: the bundled copy, else a ramfence.efi found on disk.
     pub fn default_source() -> Option<EfiSource> {
         if paths::EMBEDDED_EFI.is_some() {
             Some(EfiSource::Embedded)
@@ -83,12 +83,12 @@ impl EfiSource {
     pub fn load(&self) -> Result<Vec<u8>, String> {
         let bytes = match self {
             EfiSource::Embedded => paths::EMBEDDED_EFI
-                .ok_or("this build has no embedded badram.efi")?
+                .ok_or("this build has no embedded ramfence.efi")?
                 .to_vec(),
             EfiSource::File(p) => fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?,
         };
         if bytes.len() < 1024 || !bytes.starts_with(b"MZ") {
-            return Err("the selected badram.efi does not look like an EFI executable".into());
+            return Err("the selected ramfence.efi does not look like an EFI executable".into());
         }
         Ok(bytes)
     }
@@ -105,7 +105,7 @@ pub struct InstallOptions {
 pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
     require_admin()?;
     if win::booted_uefi() != Some(true) {
-        return Err("Windows was not booted in UEFI mode; badram.efi cannot be used".into());
+        return Err("Windows was not booted in UEFI mode; ramfence.efi cannot be used".into());
     }
     let (cfg, ranges) = validate_config(&o.config_text)?;
     log(format!(
@@ -118,8 +118,8 @@ pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
 
     let status = sysstatus::collect();
     if status.secure_boot == Some(true) && !o.allow_secure_boot {
-        return Err("Secure Boot is on: the firmware would refuse the unsigned badram.efi and \
-                    boot Windows unprotected. Turn Secure Boot off, or enroll this badram.efi's \
+        return Err("Secure Boot is on: the firmware would refuse the unsigned ramfence.efi and \
+                    boot Windows unprotected. Turn Secure Boot off, or enroll this ramfence.efi's \
                     hash in db and tick \"Allow Secure Boot\"."
             .into());
     }
@@ -132,7 +132,7 @@ pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
         suspend_bitlocker(log)?;
     }
     if status.fast_startup == Some(true) {
-        log("Warning: Fast Startup is on; a resume from hibernation skips badram.efi \
+        log("Warning: Fast Startup is on; a resume from hibernation skips ramfence.efi \
              (consider \"powercfg /h off\")."
             .into());
     }
@@ -155,11 +155,11 @@ pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
         write_bytes(&esp_dir.join(EFI_NAME), &efi)?;
         write(&esp_dir.join(CFG_NAME), &cfg_text)?;
         if !root.join(r"EFI\Microsoft\Boot\bootmgfw.efi").is_file() {
-            log("Warning: bootmgfw.efi not found on this ESP; badram.efi will search other volumes.".into());
+            log("Warning: bootmgfw.efi not found on this ESP; ramfence.efi will search other volumes.".into());
         }
         Ok(())
     })?;
-    log(format!("Copied badram.efi and badram.cfg to ESP \\{ESP_DIR}"));
+    log(format!("Copied ramfence.efi and ramfence.cfg to ESP \\{ESP_DIR}"));
 
     let id = match state::load() {
         Some(s) if bcd::entry_exists(&s.entry_id) => {
@@ -182,7 +182,7 @@ pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
     if order.first() != Some(&id) {
         return Err(format!("boot order did not change; first entry is {:?}", order.first()));
     }
-    log("BadRAM is first in the firmware boot order".into());
+    log("RAMFence is first in the firmware boot order".into());
 
     task::register(&dir.join(EXE_NAME))?;
     log(format!("Registered logon task \"{}\"", paths::TASK_NAME));
@@ -198,7 +198,7 @@ pub fn uninstall(log: Log) -> Result<(), String> {
             bcd::delete_entry(&s.entry_id)?;
             log(format!("Windows Boot Manager first again; deleted entry {}", s.entry_id));
         }
-        _ => log("No recorded BadRAM boot entry (already removed?)".into()),
+        _ => log("No recorded RAMFence boot entry (already removed?)".into()),
     }
     esp::with_esp(|root| {
         let d = root.join(ESP_DIR);
@@ -234,7 +234,7 @@ pub fn uninstall(log: Log) -> Result<(), String> {
 pub fn apply_config(text: &str, log: Log) -> Result<(), String> {
     require_admin()?;
     if state::load().is_none() {
-        return Err("BadRAM is not installed".into());
+        return Err("RAMFence is not installed".into());
     }
     let (cfg, ranges) = validate_config(text)?;
     let cfg_text = config_file_text(&cfg);
@@ -249,12 +249,12 @@ pub fn apply_config(text: &str, log: Log) -> Result<(), String> {
 
 pub fn fix_boot_order(log: Log) -> Result<(), String> {
     require_admin()?;
-    let s = state::load().ok_or("BadRAM is not installed")?;
+    let s = state::load().ok_or("RAMFence is not installed")?;
     if !bcd::entry_exists(&s.entry_id) {
         return Err(format!("boot entry {} no longer exists; install again", s.entry_id));
     }
     bcd::set_first(&s.entry_id)?;
-    log("BadRAM is first in the firmware boot order again".into());
+    log("RAMFence is first in the firmware boot order again".into());
     Ok(())
 }
 
@@ -274,7 +274,7 @@ pub fn remove_memory_limit(log: Log) -> Result<(), String> {
 /// What is on the ESP regarding the pre-boot memory test.
 #[derive(Clone, Debug)]
 pub struct TestFiles {
-    /// The installed badram.efi can run memory tests (0.2.0 or later).
+    /// The installed ramfence.efi can run memory tests (0.2.0 or later).
     pub efi_supports_test: bool,
     /// `test.req` exists: a test runs on the next boot.
     pub pending: bool,
@@ -298,8 +298,8 @@ pub fn read_test_files() -> Result<TestFiles, String> {
     })
 }
 
-/// badram.efi 0.2.0+ embeds this marker (see FEATURES in badram-efi).
-const MEMTEST_MARKER: &[u8] = b"BADRAM-FEATURES: memtest1";
+/// ramfence.efi 0.2.0+ embeds this marker (see FEATURES in ramfence-efi).
+const MEMTEST_MARKER: &[u8] = b"RAMFENCE-FEATURES: memtest1";
 
 fn efi_supports_test(efi: &Path) -> bool {
     fs::read(efi).is_ok_and(|b| contains(&b, MEMTEST_MARKER))
@@ -309,18 +309,18 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Writes `test.req` (and removes an old result) so badram.efi runs the
+/// Writes `test.req` (and removes an old result) so ramfence.efi runs the
 /// test once on the next boot.
 pub fn schedule_test(request_text: &str, log: Log) -> Result<(), String> {
     require_admin()?;
     if state::load().is_none() {
-        return Err("BadRAM is not installed".into());
+        return Err("RAMFence is not installed".into());
     }
     let req = memtest::parse_request(request_text).map_err(|e| e.to_string())?;
     esp::with_esp(|root| {
         let dir = root.join(ESP_DIR);
         if !efi_supports_test(&dir.join(EFI_NAME)) {
-            return Err("the installed badram.efi is too old to run memory tests; \
+            return Err("the installed ramfence.efi is too old to run memory tests; \
                         update the installation first (Install tab)"
                 .into());
         }
@@ -414,10 +414,10 @@ pub fn find_recovery_passwords(text: &str) -> Vec<String> {
 /// Config text for the first-time scan: reserve nothing.
 pub fn scan_only_config_text() -> String {
     Config {
-        mode: badram_core::Mode::ScanOnly,
+        mode: ramfence_core::Mode::ScanOnly,
         ranges: Vec::new(),
-        memory_type: badram_core::MemoryType::Unusable,
-        on_error: badram_core::OnError::Prompt,
+        memory_type: ramfence_core::MemoryType::Unusable,
+        on_error: ramfence_core::OnError::Prompt,
         timeout_secs: config::DEFAULT_TIMEOUT_SECS,
         chainload: None,
     }
@@ -426,7 +426,7 @@ pub fn scan_only_config_text() -> String {
 
 /// One scan range covering all RAM: from 1 MiB to past the highest address
 /// any source knows about. Parts that are not RAM are skipped (and listed
-/// as "not in memory map") by badram.efi.
+/// as "not in memory map") by ramfence.efi.
 pub fn full_scan_range(windows: &[Range], protected: &[Range], installed_bytes: Option<u64>) -> Range {
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
@@ -439,7 +439,7 @@ pub fn full_scan_range(windows: &[Range], protected: &[Range], installed_bytes: 
 }
 
 /// First-time setup, step "find bad memory": installs in scan-only mode if
-/// BadRAM is not installed yet, then schedules a scan of `scan`.
+/// RAMFence is not installed yet, then schedules a scan of `scan`.
 pub fn start_first_scan(efi: EfiSource, scan: Range, passes: u32, allow_secure_boot: bool, log: Log) -> Result<(), String> {
     if state::load().is_none() {
         install(
@@ -499,7 +499,7 @@ pub fn list_usb_disks() -> Result<Vec<UsbDisk>, String> {
 }
 
 const USB_CONFIG: &str = "\
-# BadRAM rescue USB: scan all memory on the first start, save the result on
+# RAMFence rescue USB: scan all memory on the first start, save the result on
 # this stick, then reserve the damaged areas on every start.
 mode auto
 on_error prompt
@@ -507,7 +507,7 @@ timeout 10
 ";
 
 const USB_README: &str = "\
-BadRAM rescue USB
+RAMFence rescue USB
 =================
 
 This stick protects a PC with damaged memory (RAM), even when Windows
@@ -517,17 +517,17 @@ cannot start normally.
 2. Plug in the stick, switch the PC on and open the boot menu (often F12,
    F11, F8, Esc or F10 while the maker's logo shows). Choose the USB stick
    (the entry marked UEFI).
-3. First start: BadRAM tests all memory (a few minutes; Esc stops it),
+3. First start: RAMFence tests all memory (a few minutes; Esc stops it),
    saves the result on this stick, reserves the damaged areas, then starts
    Windows. Later starts from this stick skip the test.
-4. In Windows, run BadRAM-Manager.exe from this stick (as administrator)
-   and follow the Setup tab to install BadRAM on the PC. After that the
+4. In Windows, run RAMFence-Manager.exe from this stick (as administrator)
+   and follow the Setup tab to install RAMFence on the PC. After that the
    stick is no longer needed.
 
 To test again, delete EFI\\BOOT\\test-result.txt from the stick.
 ";
 
-/// Erases `disk` and makes it a rescue USB: badram.efi as the removable
+/// Erases `disk` and makes it a rescue USB: ramfence.efi as the removable
 /// boot loader (\EFI\BOOT\BOOTX64.EFI) in `mode auto`, plus this manager
 /// and a README.
 pub fn create_usb(disk: &UsbDisk, efi: &EfiSource, log: Log) -> Result<(), String> {
@@ -555,7 +555,7 @@ if ($d.PartitionStyle -eq 'GPT') {{
 }} else {{
     $p = New-Partition -DiskNumber {n} -Size $size -MbrType FAT32 -AssignDriveLetter
 }}
-$v = Format-Volume -Partition $p -FileSystem FAT32 -NewFileSystemLabel 'BADRAM' -Confirm:$false
+$v = Format-Volume -Partition $p -FileSystem FAT32 -NewFileSystemLabel 'RAMFENCE' -Confirm:$false
 if (-not $v.DriveLetter) {{ throw 'The new partition got no drive letter.' }}
 Write-Output (\"LETTER=\" + $v.DriveLetter)"
     );
@@ -574,24 +574,24 @@ Write-Output (\"LETTER=\" + $v.DriveLetter)"
     write_bytes(&boot.join("BOOTX64.EFI"), &efi_bytes)?;
     write(&boot.join(CFG_NAME), USB_CONFIG)?;
     if let Ok(me) = std::env::current_exe() {
-        copy(&me, &root.join("BadRAM-Manager.exe"))?;
+        copy(&me, &root.join("RAMFence-Manager.exe"))?;
     }
     write(&root.join("README.txt"), &USB_README.replace('\n', "\r\n"))?;
     log(format!(
-        "Rescue USB ready on {letter}: (badram.efi in auto mode, BadRAM-Manager.exe, README.txt). \
+        "Rescue USB ready on {letter}: (ramfence.efi in auto mode, RAMFence-Manager.exe, README.txt). \
          Eject it safely before unplugging."
     ));
     Ok(())
 }
 
-/// Installs BadRAM in protect mode with `ranges` and default settings (used
+/// Installs RAMFence in protect mode with `ranges` and default settings (used
 /// after starting from a rescue USB stick).
 pub fn install_ranges(ranges: &[Range], efi: EfiSource, log: Log) -> Result<(), String> {
     let cfg = Config {
-        mode: badram_core::Mode::Protect,
+        mode: ramfence_core::Mode::Protect,
         ranges: ranges.to_vec(),
-        memory_type: badram_core::MemoryType::Unusable,
-        on_error: badram_core::OnError::Prompt,
+        memory_type: ramfence_core::MemoryType::Unusable,
+        on_error: ramfence_core::OnError::Prompt,
         timeout_secs: config::DEFAULT_TIMEOUT_SECS,
         chainload: None,
     };
@@ -608,7 +608,7 @@ pub fn protect_ranges(ranges: &[Range], log: Log) -> Result<(), String> {
         Some(Ok(c)) => c,
         _ => config::parse(&scan_only_config_text()).map_err(|e| e.to_string())?,
     };
-    cfg.mode = badram_core::Mode::Protect;
+    cfg.mode = ramfence_core::Mode::Protect;
     cfg.ranges = ranges.to_vec();
     apply_config(&cfg.to_text(), log)
 }
@@ -624,29 +624,29 @@ fn append_check_log(line: &str) {
 }
 
 /// `--check`: run at logon by the scheduled task. Returns the exit code:
-/// 0 OK, 1 check failed, 2 boot not protected, 3 badram.efi/memory problem.
+/// 0 OK, 1 check failed, 2 boot not protected, 3 ramfence.efi/memory problem.
 pub fn run_check() -> i32 {
-    const TITLE: &str = "BadRAM";
+    const TITLE: &str = "RAMFence";
     if !win::is_elevated() {
         append_check_log("Check failed: not running as administrator");
-        win::message_box(TITLE, "BadRAM check must run as administrator.", Icon::Error);
+        win::message_box(TITLE, "RAMFence check must run as administrator.", Icon::Error);
         return 1;
     }
     let Some(s) = state::load() else {
-        append_check_log("Check failed: BadRAM is not installed");
+        append_check_log("Check failed: RAMFence is not installed");
         return 1;
     };
 
     // Boot order first, so it is repaired even if we alert below.
     let mut order_note = String::new();
     if !bcd::entry_exists(&s.entry_id) {
-        order_note = format!("The BadRAM boot entry {} no longer exists. Install again.", s.entry_id);
+        order_note = format!("The RAMFence boot entry {} no longer exists. Install again.", s.entry_id);
     } else {
         match bcd::firmware_boot_order() {
             Ok(order) if order.first() == Some(&s.entry_id) => {}
             Ok(order) => match bcd::set_first(&s.entry_id) {
                 Ok(()) => append_check_log(&format!(
-                    "Boot order restored: BadRAM is first again (was: {})",
+                    "Boot order restored: RAMFence is first again (was: {})",
                     order.first().map_or("(none)", |x| x.as_str())
                 )),
                 Err(e) => order_note = format!("Could not restore the boot order: {e}"),
@@ -664,7 +664,7 @@ pub fn run_check() -> i32 {
     let st = sysstatus::collect();
     match st.verdict() {
         Verdict::Protected => {
-            let info = st.badram.as_ref();
+            let info = st.ramfence.as_ref();
             append_check_log(&format!(
                 "OK: ranges={} pages={}",
                 info.map(|i| i.ranges.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(","))
@@ -681,13 +681,13 @@ pub fn run_check() -> i32 {
             0
         }
         Verdict::NotProtected | Verdict::NotInstalled => {
-            append_check_log("NOT PROTECTED: BadRamStatus variable missing");
+            append_check_log("NOT PROTECTED: RamFenceStatus variable missing");
             win::message_box(
                 TITLE,
                 &with_note(
-                    "This boot did NOT go through badram.efi, so bad memory may be in use right now.\n\n\
+                    "This boot did NOT go through ramfence.efi, so bad memory may be in use right now.\n\n\
                      Possible causes: the boot order was changed (restored now unless noted below), \
-                     Secure Boot rejected badram.efi, or Windows resumed from hibernation.\n\n\
+                     Secure Boot rejected ramfence.efi, or Windows resumed from hibernation.\n\n\
                      Save your work and RESTART NOW."
                         .into(),
                 ),
@@ -706,7 +706,7 @@ pub fn run_check() -> i32 {
         }
         Verdict::Unknown(u) => {
             append_check_log(&format!("Check failed: {u}"));
-            win::message_box(TITLE, &with_note(format!("BadRAM check failed:\n\n{u}")), Icon::Warning);
+            win::message_box(TITLE, &with_note(format!("RAMFence check failed:\n\n{u}")), Icon::Warning);
             1
         }
     }
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn validate_matches_efi_parser() {
         let (cfg, ranges) = validate_config("range 0x1234 0x5678\non_error boot").unwrap();
-        assert_eq!(cfg.on_error, badram_core::OnError::Boot);
+        assert_eq!(cfg.on_error, ramfence_core::OnError::Boot);
         assert_eq!(ranges, vec![Range::new(0x1000, 0x6000).unwrap()]);
         assert!(validate_config("range 0x2000 0x1000").is_err());
         assert!(validate_config("").is_err());
@@ -742,7 +742,7 @@ mod tests {
     #[test]
     fn usb_config_is_valid_auto_mode() {
         let (cfg, ranges) = validate_config(USB_CONFIG).unwrap();
-        assert_eq!(cfg.mode, badram_core::Mode::Auto);
+        assert_eq!(cfg.mode, ramfence_core::Mode::Auto);
         assert!(ranges.is_empty());
     }
 
@@ -759,7 +759,7 @@ mod tests {
     #[test]
     fn scan_only_config_is_valid() {
         let (cfg, ranges) = validate_config(&scan_only_config_text()).unwrap();
-        assert_eq!(cfg.mode, badram_core::Mode::ScanOnly);
+        assert_eq!(cfg.mode, ramfence_core::Mode::ScanOnly);
         assert!(ranges.is_empty());
     }
 
@@ -780,16 +780,16 @@ mod tests {
     fn built_efi_has_memtest_marker() {
         // Skipped when the UEFI target has not been built.
         let efi = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/x86_64-unknown-uefi/release/badram.efi");
+            .join("../target/x86_64-unknown-uefi/release/ramfence.efi");
         if let Ok(bytes) = fs::read(&efi) {
             assert!(contains(&bytes, MEMTEST_MARKER), "{} lacks the marker", efi.display());
         }
-        assert!(!contains(b"BADRAM-FEATURES: memtest", MEMTEST_MARKER));
+        assert!(!contains(b"RAMFENCE-FEATURES: memtest", MEMTEST_MARKER));
     }
 
     #[test]
     fn copy_onto_itself_is_a_no_op() {
-        let dir = std::env::temp_dir().join(format!("badram-copy-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ramfence-copy-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let f = dir.join("x.bin");
         fs::write(&f, b"content").unwrap();
@@ -805,7 +805,7 @@ mod tests {
     fn written_config_reparses() {
         let (cfg, _) = validate_config("range 0x1000 0x2000\ntimeout 9").unwrap();
         let text = config_file_text(&cfg);
-        assert!(text.starts_with("# badram.cfg, written by BadRAM Manager "));
+        assert!(text.starts_with("# ramfence.cfg, written by RAMFence Manager "));
         assert_eq!(config::parse(&text).unwrap(), cfg);
     }
 }

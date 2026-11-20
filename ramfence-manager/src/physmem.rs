@@ -2,7 +2,7 @@
 //! `HKLM\HARDWARE\RESOURCEMAP\System Resources\Physical Memory\.Translated`
 //! (a REG_RESOURCE_LIST written by the kernel at boot).
 
-use badram_core::Range;
+use ramfence_core::Range;
 
 use crate::win::reg_hklm_bytes;
 

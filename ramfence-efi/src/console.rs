@@ -6,7 +6,7 @@ use alloc::string::String;
 use core::fmt::Display;
 use core::time::Duration;
 
-use badram_core::OnError;
+use ramfence_core::OnError;
 use uefi::proto::console::text::{Color, Key};
 use uefi::{boot, print, println, system};
 

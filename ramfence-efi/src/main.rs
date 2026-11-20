@@ -1,5 +1,5 @@
-//! badram.efi — reserve bad physical memory before Windows boots, then
-//! chainload bootmgfw.efi. See DESIGN.md §2 for the flow.
+//! ramfence.efi ??reserve bad physical memory before Windows boots, then
+//! chainload bootmgfw.efi. See DESIGN.md ?2 for the flow.
 
 #![no_main]
 #![no_std]
@@ -15,9 +15,9 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use badram_core::config::{self, DEFAULT_TIMEOUT_SECS};
-use badram_core::range::{self, PAGE_SIZE};
-use badram_core::{Config, MemoryType as CfgMemoryType, Mode, OnError, Range, status};
+use ramfence_core::config::{self, DEFAULT_TIMEOUT_SECS};
+use ramfence_core::range::{self, PAGE_SIZE};
+use ramfence_core::{Config, MemoryType as CfgMemoryType, Mode, OnError, Range, status};
 use uefi::boot;
 use uefi::fs::FileSystem;
 use uefi::prelude::*;
@@ -28,16 +28,16 @@ use uefi::{CString16, cstr16, guid};
 
 use console::{Decision, Log};
 
-const CONFIG_NAME: &str = "badram.cfg";
+const CONFIG_NAME: &str = "ramfence.cfg";
 const DEFAULT_CHAINLOAD: &str = "\\EFI\\Microsoft\\Boot\\bootmgfw.efi";
 
-/// Feature marker that BadRAM Manager looks for in the installed binary to
-/// tell whether this badram.efi supports memory tests.
-static FEATURES: [u8; 26] = *b"BADRAM-FEATURES: memtest1\0";
+/// Feature marker that RAMFence Manager looks for in the installed binary to
+/// tell whether this ramfence.efi supports memory tests.
+static FEATURES: [u8; 28] = *b"RAMFENCE-FEATURES: memtest1\0";
 
-/// Vendor GUID of the `BadRamStatus` variable (DESIGN.md §2.5).
+/// Vendor GUID of the `RamFenceStatus` variable (DESIGN.md ?2.5).
 pub const STATUS_VENDOR: VariableVendor =
-    VariableVendor(guid!("5b7c3f1e-9a42-4d8e-b6a1-2f0c8e4d7a93"));
+    VariableVendor(guid!("0b0c86ee-7039-477b-9a53-e39345ef90d5"));
 
 #[entry]
 fn main() -> Status {
@@ -51,7 +51,7 @@ fn main() -> Status {
     let _ = boot::set_watchdog_timer(0, 0x10000, None);
 
     console::clear();
-    console::title(concat!("badram.efi ", env!("CARGO_PKG_VERSION")));
+    console::title(concat!("ramfence.efi ", env!("CARGO_PKG_VERSION")));
     let mut log = Log::default();
 
     let config = match load_config() {
@@ -117,7 +117,7 @@ fn main() -> Status {
         log.first_error(),
     );
     if let Err(e) = set_status_variable(&status_text) {
-        log.error(format_args!("cannot set BadRamStatus variable: {:?}", e.status()));
+        log.error(format_args!("cannot set RamFenceStatus variable: {:?}", e.status()));
     }
 
     let total = range::total_pages(&ranges);
@@ -177,20 +177,20 @@ impl core::fmt::Display for Size {
 
 fn set_status_variable(text: &str) -> uefi::Result {
     runtime::set_variable(
-        cstr16!("BadRamStatus"),
+        cstr16!("RamFenceStatus"),
         &STATUS_VENDOR,
         VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS,
         text.as_bytes(),
     )
 }
 
-/// Directory of this image on its volume, with trailing `\`, e.g. `\EFI\badram\`.
+/// Directory of this image on its volume, with trailing `\`, e.g. `\EFI\ramfence\`.
 fn image_dir() -> Result<String, String> {
     let li = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
         .map_err(|e| format!("cannot open LoadedImage: {:?}", e.status()))?;
     let fp = li
         .file_path()
-        .ok_or_else(|| "badram.efi has no file path".to_string())?;
+        .ok_or_else(|| "ramfence.efi has no file path".to_string())?;
 
     let mut path = String::new();
     for node in fp.node_iter() {
@@ -204,7 +204,7 @@ fn image_dir() -> Result<String, String> {
         }
     }
     if path.is_empty() {
-        return Err("cannot determine badram.efi file path".to_string());
+        return Err("cannot determine ramfence.efi file path".to_string());
     }
     if !path.starts_with('\\') {
         path.insert(0, '\\');
@@ -219,7 +219,7 @@ fn load_config() -> Result<Config, String> {
     let path16 = CString16::try_from(path.as_str())
         .map_err(|_| format!("invalid config path '{path}'"))?;
     let sfs = boot::get_image_file_system(boot::image_handle())
-        .map_err(|e| format!("cannot open badram.efi's volume: {:?}", e.status()))?;
+        .map_err(|e| format!("cannot open ramfence.efi's volume: {:?}", e.status()))?;
     let bytes = FileSystem::new(sfs)
         .read(&*path16)
         .map_err(|e| match e {

@@ -1,4 +1,4 @@
-//! Parser for `badram.cfg` (see DESIGN.md §3).
+//! Parser for `ramfence.cfg` (see DESIGN.md §3).
 //!
 //! Line-oriented, `#` starts a comment (anywhere on the line). Keys:
 //!
@@ -69,7 +69,7 @@ impl OnError {
     }
 }
 
-/// What badram.efi does with the configured ranges.
+/// What ramfence.efi does with the configured ranges.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
     /// Reserve the configured ranges (the normal mode).
@@ -78,7 +78,7 @@ pub enum Mode {
     /// Reserve nothing: only run a scheduled memory test, then boot. Used
     /// to find the bad ranges on a new machine. Takes no `range` lines.
     ScanOnly,
-    /// Rescue USB: if no saved test result exists next to badram.efi, scan
+    /// Rescue USB: if no saved test result exists next to ramfence.efi, scan
     /// all memory first and save the result; then reserve the error ranges
     /// from that result (plus a margin). Takes no `range` lines.
     Auto,
@@ -142,9 +142,9 @@ pub enum ParseErrorKind {
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.line > 0 {
-            write!(f, "badram.cfg line {}: ", self.line)?;
+            write!(f, "ramfence.cfg line {}: ", self.line)?;
         } else {
-            write!(f, "badram.cfg: ")?;
+            write!(f, "ramfence.cfg: ")?;
         }
         match &self.kind {
             ParseErrorKind::UnknownKey(k) => write!(f, "unknown key '{k}'"),
@@ -173,7 +173,7 @@ impl fmt::Display for ParseError {
 
 impl core::error::Error for ParseError {}
 
-/// Parses the contents of `badram.cfg`. Accepts LF or CRLF line endings and a
+/// Parses the contents of `ramfence.cfg`. Accepts LF or CRLF line endings and a
 /// leading UTF-8 BOM (Notepad adds one).
 pub fn parse(text: &str) -> Result<Config, ParseError> {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
@@ -324,12 +324,12 @@ fn match_value<T: Copy>(
 }
 
 impl Config {
-    /// Serializes back to `badram.cfg` syntax. `parse(&c.to_text()) == Ok(c)`.
+    /// Serializes back to `ramfence.cfg` syntax. `parse(&c.to_text()) == Ok(c)`.
     pub fn to_text(&self) -> String {
         use core::fmt::Write;
         let mut s = String::new();
         // Writing to a String cannot fail. `mode protect` is the default
-        // and is omitted, so older badram.efi builds still parse the file.
+        // and is omitted, so older ramfence.efi builds still parse the file.
         if self.mode != Mode::Protect {
             let _ = writeln!(s, "mode {}", self.mode.name());
         }
@@ -555,9 +555,9 @@ chainload \\EFI\\Some Dir\\shell.efi
     #[test]
     fn error_display() {
         let e = parse("range 0x1000 0x2000\nfoo").unwrap_err();
-        assert_eq!(e.to_string(), "badram.cfg line 2: unknown key 'foo'");
+        assert_eq!(e.to_string(), "ramfence.cfg line 2: unknown key 'foo'");
         let e = parse("").unwrap_err();
-        assert_eq!(e.to_string(), "badram.cfg: no 'range' line found");
+        assert_eq!(e.to_string(), "ramfence.cfg: no 'range' line found");
     }
 
     #[test]
@@ -606,7 +606,7 @@ chainload \\EFI\\Some Dir\\shell.efi
         assert_eq!(parse(&c.to_text()), Ok(c));
         let e = parse("mode auto\nrange 0x1000 0x2000").unwrap_err();
         assert_eq!(e.kind, ParseErrorKind::RangesNotAllowed("auto"));
-        assert_eq!(e.to_string(), "badram.cfg: 'range' lines are not allowed with 'mode auto'");
+        assert_eq!(e.to_string(), "ramfence.cfg: 'range' lines are not allowed with 'mode auto'");
     }
 
     #[test]

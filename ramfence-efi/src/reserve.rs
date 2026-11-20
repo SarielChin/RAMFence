@@ -3,8 +3,8 @@
 
 use alloc::vec::Vec;
 
-use badram_core::memmap::{self, MemDesc, type_name};
-use badram_core::{MemoryType as CfgMemoryType, Range};
+use ramfence_core::memmap::{self, MemDesc, type_name};
+use ramfence_core::{MemoryType as CfgMemoryType, Range};
 use uefi::boot::{self, AllocateType};
 use uefi::mem::memory_map::{MemoryMap, MemoryType};
 use uefi::proto::loaded_image::LoadedImage;
@@ -105,7 +105,7 @@ pub fn run(ranges: &[Range], cfg_type: CfgMemoryType, log: &mut Log) -> Outcome 
         && let Some(r) = memmap::find_overlap(ranges, &img)
     {
         log.warn(format_args!(
-            "badram.efi itself is loaded at {img}, inside configured range {r}"
+            "ramfence.efi itself is loaded at {img}, inside configured range {r}"
         ));
     }
 

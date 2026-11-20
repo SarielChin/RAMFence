@@ -1,18 +1,18 @@
 <#
 .SYNOPSIS
-    Check that this boot went through badram.efi (DESIGN.md section 5.3).
+    Check that this boot went through ramfence.efi (DESIGN.md section 5.3).
 
 .DESCRIPTION
     Run as Administrator; install.ps1 registers it as a logon task.
-      - Reads the volatile BadRamStatus firmware variable.
+      - Reads the volatile RamFenceStatus firmware variable.
         Missing  -> this boot was NOT protected (boot order changed, or the
-                    firmware rejected badram.efi): alert, restart needed.
-        ok=0     -> badram.efi reported an error: alert with the message.
+                    firmware rejected ramfence.efi): alert, restart needed.
+        ok=0     -> ramfence.efi reported an error: alert with the message.
         ok=1     -> protected.
-      - Makes sure the BadRAM entry is still first in the firmware boot
+      - Makes sure the RAMFence entry is still first in the firmware boot
         order and restores it if Windows Update moved it (unless -NoFix).
 
-    Exit codes: 0 OK, 1 check failed, 2 boot not protected, 3 badram.efi error.
+    Exit codes: 0 OK, 1 check failed, 2 boot not protected, 3 ramfence.efi error.
 
 .PARAMETER NoFix
     Report only; do not change the boot order.
@@ -32,57 +32,57 @@ $ErrorActionPreference = 'Stop'
 function Write-CheckLog([string]$Message) {
     $line = '{0}  {1}' -f (Get-Date -Format 's'), $Message
     Write-Host $line
-    if (Test-Path $BadRamInstallDir) {
-        try { Add-Content -Path $BadRamLogFile -Value $line -Encoding UTF8 } catch { }
+    if (Test-Path $RamFenceInstallDir) {
+        try { Add-Content -Path $RamFenceLogFile -Value $line -Encoding UTF8 } catch { }
     }
 }
 
 function Show-Alert([string]$Message, [string]$Icon = 'Warning') {
     if ($NoPopup) { return }
     Add-Type -AssemblyName System.Windows.Forms
-    [void][System.Windows.Forms.MessageBox]::Show($Message, 'BadRAM', 'OK', $Icon)
+    [void][System.Windows.Forms.MessageBox]::Show($Message, 'RAMFence', 'OK', $Icon)
 }
 
 $exitCode = 0
 try {
     Assert-Admin
-    $state = Get-BadRamState
-    if (-not $state) { throw "BadRAM is not installed ($BadRamStateFile missing)." }
+    $state = Get-RamFenceState
+    if (-not $state) { throw "RAMFence is not installed ($RamFenceStateFile missing)." }
     $id = $state.EntryId.ToLowerInvariant()
 
     # Boot order first, so the fix is in place even if we alert below.
     $orderNote = ''
     if (-not (Test-BcdEntry $id)) {
-        $orderNote = "The BadRAM boot entry $id no longer exists. Run install.ps1 again."
+        $orderNote = "The RAMFence boot entry $id no longer exists. Run install.ps1 again."
     } else {
         $order = Get-FirmwareBootOrder
         if ($order.Count -eq 0 -or $order[0] -ne $id) {
             $first = if ($order.Count) { $order[0] } else { '(none)' }
             if ($NoFix) {
-                $orderNote = "BadRAM is not first in the boot order (first: $first)."
+                $orderNote = "RAMFence is not first in the boot order (first: $first)."
             } else {
-                Set-BadRamFirst $id
-                Write-CheckLog "Boot order restored: BadRAM is first again (was: $first)."
+                Set-RamFenceFirst $id
+                Write-CheckLog "Boot order restored: RAMFence is first again (was: $first)."
             }
         }
     }
     if ($orderNote) { Write-CheckLog $orderNote }
 
-    $status = Get-BadRamStatus
+    $status = Get-RamFenceStatus
     if (-not $status.Present) {
         $exitCode = 2
-        $msg = "This boot did NOT go through badram.efi, so bad memory may be in use right now.`n`n" +
+        $msg = "This boot did NOT go through ramfence.efi, so bad memory may be in use right now.`n`n" +
             "Possible causes: the boot order was changed (restored now unless noted below), " +
-            "Secure Boot rejected badram.efi, or Windows resumed from hibernation.`n`n" +
+            "Secure Boot rejected ramfence.efi, or Windows resumed from hibernation.`n`n" +
             "Save your work and RESTART NOW (a full restart, not shut down + power on with Fast Startup)."
         if ($orderNote) { $msg += "`n`n$orderNote" }
-        Write-CheckLog 'NOT PROTECTED: BadRamStatus variable missing.'
+        Write-CheckLog 'NOT PROTECTED: RamFenceStatus variable missing.'
         Show-Alert $msg 'Error'
     } elseif ($status.Fields['ok'] -ne '1') {
         $exitCode = 3
         $err = $status.Fields['error']
-        Write-CheckLog "badram.efi reported an error: $err  [$($status.Raw)]"
-        Show-Alert ("badram.efi reported an error during boot; bad memory may not be fully protected.`n`n$err" +
+        Write-CheckLog "ramfence.efi reported an error: $err  [$($status.Raw)]"
+        Show-Alert ("ramfence.efi reported an error during boot; bad memory may not be fully protected.`n`n$err" +
             $(if ($orderNote) { "`n`n$orderNote" } else { '' })) 'Error'
     } else {
         Write-CheckLog "OK: ranges=$($status.Fields['ranges']) pages=$($status.Fields['pages']) type=$($status.Fields['type'])"
@@ -91,6 +91,6 @@ try {
 } catch {
     $exitCode = 1
     Write-CheckLog "Check failed: $($_.Exception.Message)"
-    Show-Alert "BadRAM check failed:`n`n$($_.Exception.Message)"
+    Show-Alert "RAMFence check failed:`n`n$($_.Exception.Message)"
 }
 exit $exitCode

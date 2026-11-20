@@ -1,4 +1,4 @@
-//! Logon task that runs `badram-manager.exe --check` elevated.
+//! Logon task that runs `ramfence-manager.exe --check` elevated.
 
 use std::path::Path;
 
@@ -18,7 +18,7 @@ pub fn task_xml(user: &str, exe: &str) -> String {
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Checks that this boot went through badram.efi and keeps it first in the boot order.</Description>
+    <Description>Checks that this boot went through ramfence.efi and keeps it first in the boot order.</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -64,7 +64,7 @@ pub fn register(exe: &Path) -> Result<(), String> {
     // schtasks expects UTF-16LE with BOM when the declaration says UTF-16.
     let mut bytes = vec![0xFF, 0xFE];
     bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
-    let tmp = std::env::temp_dir().join("badram-task.xml");
+    let tmp = std::env::temp_dir().join("ramfence-task.xml");
     std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write task XML: {e}"))?;
     let tmp_s = tmp.to_string_lossy().into_owned();
     let result = run_ok("schtasks.exe", &["/Create", "/TN", TASK_NAME, "/XML", &tmp_s, "/F"]);
@@ -89,9 +89,9 @@ mod tests {
 
     #[test]
     fn xml_escapes_values() {
-        let x = task_xml("PC\\a&b", r"C:\Program Files\BadRAM\badram-manager.exe");
+        let x = task_xml("PC\\a&b", r"C:\Program Files\RAMFence\ramfence-manager.exe");
         assert!(x.contains("<UserId>PC\\a&amp;b</UserId>"));
-        assert!(x.contains(r"<Command>C:\Program Files\BadRAM\badram-manager.exe</Command>"));
+        assert!(x.contains(r"<Command>C:\Program Files\RAMFence\ramfence-manager.exe</Command>"));
         assert!(x.contains("<Arguments>--check</Arguments>"));
     }
 }

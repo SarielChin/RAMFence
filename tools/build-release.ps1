@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Build a single-file release: dist\BadRAM-Manager-<version>.exe with
-    badram.efi embedded.
+    Build a single-file release: dist\RAMFence-Manager-<version>.exe with
+    ramfence.efi embedded.
 
 .DESCRIPTION
-    1. Builds badram.efi (x86_64-unknown-uefi, release).
+    1. Builds ramfence.efi (x86_64-unknown-uefi, release).
     2. Runs the unit tests.
-    3. Builds badram-manager.exe (release); its build.rs embeds the
-       badram.efi from step 1.
+    3. Builds ramfence-manager.exe (release); its build.rs embeds the
+       ramfence.efi from step 1.
     4. Copies the result to dist\ and prints its SHA-256.
 
     Needs rustup's x86_64-unknown-uefi target and, for the GNU host
@@ -35,27 +35,27 @@ function Invoke-Cargo {
 
 Push-Location $Root
 try {
-    Invoke-Cargo build -p badram-efi --target x86_64-unknown-uefi --release
-    Invoke-Cargo test -p badram-core -p badram-manager
-    # Separate target dir: a running copy of target\release\badram-manager.exe
+    Invoke-Cargo build -p ramfence-efi --target x86_64-unknown-uefi --release
+    Invoke-Cargo test -p ramfence-core -p ramfence-manager
+    # Separate target dir: a running copy of target\release\ramfence-manager.exe
     # (e.g. open for testing) would otherwise lock the output file.
-    Invoke-Cargo build -p badram-manager --release --target-dir target\pkg
+    Invoke-Cargo build -p ramfence-manager --release --target-dir target\pkg
 
-    $version = (Select-String -Path badram-manager\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+    $version = (Select-String -Path ramfence-manager\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
     $dist = Join-Path $Root 'dist'
     New-Item -ItemType Directory -Force $dist | Out-Null
-    $out = Join-Path $dist "BadRAM-Manager-$version.exe"
-    Copy-Item target\pkg\release\badram-manager.exe $out -Force
+    $out = Join-Path $dist "RAMFence-Manager-$version.exe"
+    Copy-Item target\pkg\release\ramfence-manager.exe $out -Force
 
-    $efi = [IO.File]::ReadAllBytes((Join-Path $Root 'target\x86_64-unknown-uefi\release\badram.efi'))
+    $efi = [IO.File]::ReadAllBytes((Join-Path $Root 'target\x86_64-unknown-uefi\release\ramfence.efi'))
     $exe = [IO.File]::ReadAllBytes($out)
-    # Sanity check: the exe must contain the embedded badram.efi marker.
-    if (-not [Text.Encoding]::ASCII.GetString($exe).Contains('BADRAM-FEATURES: memtest1')) {
-        throw 'badram.efi was not embedded into the manager'
+    # Sanity check: the exe must contain the embedded ramfence.efi marker.
+    if (-not [Text.Encoding]::ASCII.GetString($exe).Contains('RAMFENCE-FEATURES: memtest1')) {
+        throw 'ramfence.efi was not embedded into the manager'
     }
     Write-Host ''
     Write-Host "Release: $out" -ForegroundColor Green
-    Write-Host ("  size    {0:N0} bytes (badram.efi {1:N0} bytes embedded)" -f $exe.Length, $efi.Length)
+    Write-Host ("  size    {0:N0} bytes (ramfence.efi {1:N0} bytes embedded)" -f $exe.Length, $efi.Length)
     Write-Host "  sha256  $((Get-FileHash $out -Algorithm SHA256).Hash)"
 } finally {
     Pop-Location

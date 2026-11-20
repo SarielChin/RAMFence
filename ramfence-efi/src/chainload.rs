@@ -84,7 +84,7 @@ pub fn boot(path: &str, log: &mut Log) -> Result<(), String> {
     log.info(format_args!(
         "Starting {path} (volume {}{})",
         index,
-        if index == 0 { ", same as badram.efi" } else { "" }
+        if index == 0 { ", same as ramfence.efi" } else { "" }
     ));
 
     let dp = full_device_path(*handle, &path16)?;

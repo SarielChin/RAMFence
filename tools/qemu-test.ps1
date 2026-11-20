@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Run badram.efi under QEMU + OVMF (DESIGN.md section 7.2) and capture the
+    Run ramfence.efi under QEMU + OVMF (DESIGN.md section 7.2) and capture the
     serial console.
 
 .DESCRIPTION
     Builds a FAT test folder per case under target\qemu\<case>\esp with
-    badram.efi + badram.cfg in \EFI\badram\ and a startup.nsh for the
-    built-in UEFI Shell. The shell runs badram.efi; afterwards it prints
-    `memmap` and the BadRamStatus variable, then powers off.
+    ramfence.efi + ramfence.cfg in \EFI\ramfence\ and a startup.nsh for the
+    built-in UEFI Shell. The shell runs ramfence.efi; afterwards it prints
+    `memmap` and the RamFenceStatus variable, then powers off.
 
     Cases that hit the on_error prompt get their key presses sent through
     QMP once the expected text appears on the serial console.
@@ -38,7 +38,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
-$VendorGuid = '5B7C3F1E-9A42-4D8E-B6A1-2F0C8E4D7A93'
+$VendorGuid = '0B0C86EE-7039-477B-9A53-E39345EF90D5'
 $QmpPort = 4444
 $Missing = '\EFI\none\missing.efi'
 
@@ -52,10 +52,10 @@ range 0x50000123 0x50000fff   # unaligned: expands to one page
 
 $Cases = @{
     'ok'             = @{
-        # Stage 1 chainloads a second copy of badram.efi. That exercises
+        # Stage 1 chainloads a second copy of ramfence.efi. That exercises
         # LoadImage/StartImage via a full device path and the second copy
-        # finding its own badram.cfg. Stage 2's ranges are already reserved.
-        Cfg    = "$TestRanges`non_error boot`ntimeout 1`nchainload \EFI\stage2\badram.efi`n"
+        # finding its own ramfence.cfg. Stage 2's ranges are already reserved.
+        Cfg    = "$TestRanges`non_error boot`ntimeout 1`nchainload \EFI\stage2\ramfence.efi`n"
         Stage2 = "$TestRanges`non_error boot`ntimeout 0`nchainload $Missing`n"
         Keys   = @()
     }
@@ -105,7 +105,7 @@ $Cases = @{
         # used without scanning; error cluster + 256 MiB margin reserved:
         # expect Unusable 0x20000000-0x408FFFFF.
         Cfg    = "mode auto`non_error boot`ntimeout 0`nchainload $Missing`n"
-        Result = "badram-test 1`nresult complete`npasses 1`nrequested 0x100000 0x80000000`ntested 0x100000 0x80000000`nerrors 2`nmask 0x0000ff0000000000`nlowest 0x30000100`nhighest 0x30800000`nbucket 0x30000000 2`nerror 0x30000100 0x30000100 0x0000ff0030000100`nerror 0x30800000 0x30800000 0x0000ff0030800000`n"
+        Result = "ramfence-test 1`nresult complete`npasses 1`nrequested 0x100000 0x80000000`ntested 0x100000 0x80000000`nerrors 2`nmask 0x0000ff0000000000`nlowest 0x30000100`nhighest 0x30800000`nbucket 0x30000000 2`nerror 0x30000100 0x30000100 0x0000ff0030000100`nerror 0x30800000 0x30800000 0x0000ff0030800000`n"
         Keys   = @()
     }
     'halt'           = @{
@@ -122,14 +122,14 @@ $Spec = $Cases[$Case]
 
 # --- build -----------------------------------------------------------------
 
-$Efi = Join-Path $Root 'target\x86_64-unknown-uefi\release\badram.efi'
+$Efi = Join-Path $Root 'target\x86_64-unknown-uefi\release\ramfence.efi'
 if (-not $NoBuild) {
     Push-Location $Root
     # cargo reports progress on stderr; Windows PowerShell would turn that
     # into a terminating error under 'Stop'.
     $ErrorActionPreference = 'Continue'
     try {
-        cargo build -p badram-efi --target x86_64-unknown-uefi --release 2>&1 | ForEach-Object { "$_" }
+        cargo build -p ramfence-efi --target x86_64-unknown-uefi --release 2>&1 | ForEach-Object { "$_" }
         if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
     } finally {
         $ErrorActionPreference = 'Stop'
@@ -142,33 +142,33 @@ if (-not $NoBuild) {
 $CaseDir = Join-Path $Root "target\qemu\$Case"
 if (Test-Path $CaseDir) { Remove-Item -Recurse -Force $CaseDir }
 $Esp = Join-Path $CaseDir 'esp'
-New-Item -ItemType Directory -Force (Join-Path $Esp 'EFI\badram') | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $Esp 'EFI\ramfence') | Out-Null
 
 function Write-Ascii([string]$Path, [string]$Text) {
     [IO.File]::WriteAllText($Path, $Text.Replace("`r`n", "`n"), [Text.Encoding]::ASCII)
 }
 
-Copy-Item $Efi (Join-Path $Esp 'EFI\badram\badram.efi')
-if ($null -ne $Spec.Cfg) { Write-Ascii (Join-Path $Esp 'EFI\badram\badram.cfg') $Spec.Cfg }
-if ($Spec.ContainsKey('TestReq')) { Write-Ascii (Join-Path $Esp 'EFI\badram\test.req') $Spec.TestReq }
-if ($Spec.ContainsKey('Result')) { Write-Ascii (Join-Path $Esp 'EFI\badram\test-result.txt') $Spec.Result }
+Copy-Item $Efi (Join-Path $Esp 'EFI\ramfence\ramfence.efi')
+if ($null -ne $Spec.Cfg) { Write-Ascii (Join-Path $Esp 'EFI\ramfence\ramfence.cfg') $Spec.Cfg }
+if ($Spec.ContainsKey('TestReq')) { Write-Ascii (Join-Path $Esp 'EFI\ramfence\test.req') $Spec.TestReq }
+if ($Spec.ContainsKey('Result')) { Write-Ascii (Join-Path $Esp 'EFI\ramfence\test-result.txt') $Spec.Result }
 $Mem = if ($Spec.ContainsKey('Mem')) { $Spec.Mem } else { '2G' }
 if ($Spec.Stage2) {
     New-Item -ItemType Directory -Force (Join-Path $Esp 'EFI\stage2') | Out-Null
-    Copy-Item $Efi (Join-Path $Esp 'EFI\stage2\badram.efi')
-    Write-Ascii (Join-Path $Esp 'EFI\stage2\badram.cfg') $Spec.Stage2
+    Copy-Item $Efi (Join-Path $Esp 'EFI\stage2\ramfence.efi')
+    Write-Ascii (Join-Path $Esp 'EFI\stage2\ramfence.cfg') $Spec.Stage2
 }
 
 Write-Ascii (Join-Path $Esp 'startup.nsh') @"
 fs0:
-\EFI\badram\badram.efi
+\EFI\ramfence\ramfence.efi
 echo "=== memmap ==="
 memmap
-echo "=== BadRamStatus ==="
-dmpstore BadRamStatus -guid $VendorGuid
+echo "=== RamFenceStatus ==="
+dmpstore RamFenceStatus -guid $VendorGuid
 echo "=== files ==="
-ls \EFI\badram
-type \EFI\badram\test-result.txt
+ls \EFI\ramfence
+type \EFI\ramfence\test-result.txt
 echo "=== end ==="
 reset -s
 "@

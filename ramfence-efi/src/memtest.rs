@@ -1,8 +1,8 @@
-//! Runs a memory test scheduled by BadRAM Manager (`test.req` next to
-//! badram.efi), once, before any range is reserved.
+//! Runs a memory test scheduled by RAMFence Manager (`test.req` next to
+//! ramfence.efi), once, before any range is reserved.
 //!
 //! Free memory in the requested ranges is allocated in 64 MiB chunks,
-//! tested with badram-core's engine through volatile accesses (UEFI
+//! tested with ramfence-core's engine through volatile accesses (UEFI
 //! identity-maps physical memory), then freed again so the normal
 //! reservation sees exactly what it would have seen without a test.
 
@@ -11,12 +11,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 
-use badram_core::memmap::{self, type_name};
-use badram_core::memtest::{
+use ramfence_core::memmap::{self, type_name};
+use ramfence_core::memtest::{
     self, REQUEST_FILE, RESULT_FILE, TestHost, TestMemory, TestResult, Untested,
 };
-use badram_core::config::AUTO_MARGIN;
-use badram_core::{PAGE_SIZE, Range};
+use ramfence_core::config::AUTO_MARGIN;
+use ramfence_core::{PAGE_SIZE, Range};
 use uefi::boot::{self, AllocateType};
 use uefi::fs::FileSystem;
 use uefi::mem::memory_map::MemoryType;
@@ -82,7 +82,7 @@ fn path16(dir: &str, name: &str) -> Option<CString16> {
 fn open_fs() -> Result<FileSystem, String> {
     boot::get_image_file_system(boot::image_handle())
         .map(FileSystem::new)
-        .map_err(|e| format!("cannot open badram.efi's volume: {:?}", e.status()))
+        .map_err(|e| format!("cannot open ramfence.efi's volume: {:?}", e.status()))
 }
 
 /// Runs the test if `test.req` exists. Returns true if a test ran (so the
@@ -138,7 +138,7 @@ fn save_result(dir: &str, path: &CString16, result: &TestResult, log: &mut Log) 
     }
 }
 
-/// `mode auto` (rescue USB): use the saved result next to badram.efi, or
+/// `mode auto` (rescue USB): use the saved result next to ramfence.efi, or
 /// scan all memory once and save it. Returns the ranges to reserve (error
 /// clusters plus [`AUTO_MARGIN`]) and whether a scan ran this boot.
 pub fn auto(dir: &str, log: &mut Log) -> (Vec<Range>, bool) {
