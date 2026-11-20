@@ -37,6 +37,12 @@ pub fn installed_cfg() -> PathBuf {
     install_dir().join(CFG_NAME)
 }
 
+/// badram.efi bundled into this executable at build time (see build.rs).
+#[cfg(embedded_efi)]
+pub const EMBEDDED_EFI: Option<&[u8]> = Some(include_bytes!(concat!(env!("OUT_DIR"), "/badram.efi")));
+#[cfg(not(embedded_efi))]
+pub const EMBEDDED_EFI: Option<&[u8]> = None;
+
 /// Where to look for badram.efi to install: next to this exe, the install
 /// directory, then the repository's release build (when run from target\).
 pub fn efi_candidates() -> Vec<PathBuf> {

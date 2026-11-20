@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 
 use badram_core::config::parse_address;
-use badram_core::{Config, MemoryType, OnError, PAGE_SIZE, Range, range};
+use badram_core::{Config, MemoryType, Mode, OnError, PAGE_SIZE, Range, range};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::ops::{self, InstallOptions, Log};
@@ -17,6 +17,7 @@ const DEFAULT_CHAINLOAD: &str = r"\EFI\Microsoft\Boot\bootmgfw.efi";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Setup,
     Status,
     Config,
     MemTest,
@@ -43,6 +44,7 @@ enum Confirm {
     ApplyConfig,
     RemoveLimit,
     Restart,
+    RestartFirmware,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,6 +114,7 @@ impl Editor {
         }
         let chainload = self.chainload.trim();
         let cfg = Config {
+            mode: Mode::Protect,
             ranges,
             memory_type: self.memory_type,
             on_error: self.on_error,
@@ -128,13 +131,24 @@ pub struct ManagerApp {
     status: Option<SystemStatus>,
     status_rx: Option<Receiver<SystemStatus>>,
     editor: Editor,
-    efi_path: String,
+    /// badram.efi to install; None until the user picks a file (only when
+    /// this build has no embedded copy and none was found).
+    efi: Option<ops::EfiSource>,
     suspend_bitlocker: bool,
     allow_secure_boot: bool,
     job: Option<Job>,
     log: Vec<(LineKind, String)>,
     confirm: Option<Confirm>,
     mt: MemTestState,
+    setup: SetupState,
+    /// The first status picked the starting tab (Setup or Status).
+    tab_chosen: bool,
+}
+
+struct SetupState {
+    recovery_keys: Option<Result<Vec<String>, String>>,
+    key_saved: bool,
+    passes: u32,
 }
 
 struct MemTestState {
@@ -218,13 +232,15 @@ impl ManagerApp {
             status: None,
             status_rx: None,
             editor,
-            efi_path: paths::find_efi().map(|p| p.display().to_string()).unwrap_or_default(),
+            efi: ops::EfiSource::default_source(),
             suspend_bitlocker: false,
             allow_secure_boot: false,
             job: None,
             log: Vec::new(),
             confirm: None,
             mt,
+            setup: SetupState { recovery_keys: None, key_saved: false, passes: 1 },
+            tab_chosen: false,
         };
         app.refresh(&cc.egui_ctx);
         app
@@ -275,6 +291,16 @@ impl ManagerApp {
         if let Some(rx) = &self.status_rx
             && let Ok(s) = rx.try_recv()
         {
+            // Start on the Setup tab until protection is configured.
+            if !self.tab_chosen {
+                self.tab_chosen = true;
+                let configured = sysstatus::load_installed_config()
+                    .and_then(Result::ok)
+                    .is_some_and(|c| c.mode == Mode::Protect);
+                if !configured {
+                    self.tab = Tab::Setup;
+                }
+            }
             self.status = Some(s);
             self.status_rx = None;
         }
@@ -574,7 +600,7 @@ impl ManagerApp {
         };
         ui.strong("Pre-flight checks");
         let built = self.editor.build();
-        let efi_ok = PathBuf::from(&self.efi_path).is_file();
+        let efi_ok = self.efi.as_ref().is_some_and(|e| e.load().is_ok());
         let sb_on = s.secure_boot == Some(true);
         let bl_on = s.bitlocker.as_deref() == Some("On");
 
@@ -607,15 +633,7 @@ impl ManagerApp {
         });
         ui.add_space(8.0);
 
-        ui.horizontal(|ui| {
-            ui.label("badram.efi:");
-            ui.add(egui::TextEdit::singleline(&mut self.efi_path).desired_width(420.0));
-            if ui.button("Browse…").clicked()
-                && let Some(p) = rfd::FileDialog::new().add_filter("EFI application", &["efi"]).pick_file()
-            {
-                self.efi_path = p.display().to_string();
-            }
-        });
+        self.efi_picker(ui);
         if bl_on {
             ui.checkbox(&mut self.suspend_bitlocker, "Suspend BitLocker for 2 reboots (I have backed up the recovery key)");
         }
@@ -654,7 +672,7 @@ impl ManagerApp {
                 }).unwrap_or_default();
                 ("Install BadRAM?", format!(
                     "This changes the firmware boot order so badram.efi starts before Windows.\n\n\
-                     Configuration: {summary}\nbadram.efi: {}\n\nA BCD backup is saved first.", self.efi_path))
+                     Configuration: {summary}\nbadram.efi: {}\n\nA BCD backup is saved first.", self.efi_label()))
             }
             Confirm::Uninstall => ("Uninstall BadRAM?", "Windows Boot Manager is put first again and BadRAM is removed.\n\n\
                  After the next boot Windows CAN use the bad memory again. Restore a memory limit first if needed.".into()),
@@ -662,7 +680,10 @@ impl ManagerApp {
             Confirm::RemoveLimit => ("Remove memory limit?", "truncatememory is removed from the running Windows entry, so Windows uses all memory \
                  badram.efi does not reserve.\n\nOnly do this while BadRAM protection is verified.".into()),
             Confirm::Restart => ("Restart now?", "Windows restarts immediately. Save your work first.\n\n\
-                 The scheduled memory test runs before Windows starts; press Esc on that screen to abort it.".into()),
+                 If a memory scan is scheduled, it runs before Windows starts; press Esc on that screen to stop it.".into()),
+            Confirm::RestartFirmware => ("Restart into firmware settings?", "Windows restarts immediately into the PC's \
+                 firmware settings (BIOS). Save your work first.\n\nTurn Secure Boot off there, then save and exit \
+                 (usually F10). Windows starts again afterwards.".into()),
         };
         let mut decision = None;
         egui::Modal::new(egui::Id::unique("badram-confirm")).show(ctx, |ui| {
@@ -694,9 +715,10 @@ impl ManagerApp {
         match which {
             Confirm::Install => {
                 let Ok(c) = self.editor.build() else { return };
+                let Some(efi) = self.efi.clone() else { return };
                 let opts = InstallOptions {
                     config_text: c.to_text(),
-                    efi: PathBuf::from(&self.efi_path),
+                    efi,
                     suspend_bitlocker: self.suspend_bitlocker,
                     allow_secure_boot: self.allow_secure_boot,
                 };
@@ -710,6 +732,7 @@ impl ManagerApp {
             }
             Confirm::RemoveLimit => self.start_job(ctx, "Remove memory limit", ops::remove_memory_limit),
             Confirm::Restart => self.start_job(ctx, "Restart", ops::restart_now),
+            Confirm::RestartFirmware => self.start_job(ctx, "Restart into firmware settings", ops::restart_to_firmware),
         }
     }
 
@@ -756,6 +779,12 @@ impl ManagerApp {
             if ui.button(format!("Reset to configured ranges ± {DEFAULT_MARGIN_MIB} MiB")).clicked() {
                 let cfg = self.editor.build().ok();
                 self.mt.rows = MemTestState::rows_around(cfg.as_ref());
+            }
+            if ui.button("All memory").on_hover_text("One range covering all RAM; parts that are not RAM are skipped.").clicked()
+                && let Some(s) = &self.status
+            {
+                let r = ops::full_scan_range(s.windows_ranges.as_deref().unwrap_or(&[]), &s.protected_ranges(), s.installed_mem);
+                self.mt.rows = vec![RangeRow { start: format!("{:#x}", r.start()), end: format!("{:#x}", r.end()) }];
             }
         });
         ui.horizontal(|ui| {
@@ -832,7 +861,9 @@ impl ManagerApp {
 
     fn show_result(&mut self, ui: &mut egui::Ui, r: &badram_core::memtest::TestResult) {
         let e = &r.errors;
-        let untested: u64 = r.untested.iter().map(|u| u.range.len()).sum();
+        // "not in memory map" = not RAM at all (MMIO holes etc.): not a gap
+        // in the test.
+        let untested: u64 = r.untested.iter().filter(|u| !is_not_ram(u)).map(|u| u.range.len()).sum();
         let (level, headline) = match (r.completed, e.count) {
             (false, _) => (Level::Warn, format!("Aborted after finding {} error(s).", e.count)),
             (true, 0) => (Level::Good, "No errors found.".to_string()),
@@ -844,7 +875,7 @@ impl ManagerApp {
             ui.label(format!("{} in {} region(s), {} pass(es)", report::size(r.tested_bytes()), r.tested.len(), r.passes));
             ui.end_row();
             ui.strong("Untested");
-            ui.label(if untested == 0 { "none".to_string() } else { format!("{} (in use by firmware or not RAM)", report::size(untested)) });
+            ui.label(if untested == 0 { "none".to_string() } else { format!("{} (in use by the firmware)", report::size(untested)) });
             ui.end_row();
             if let (Some(lo), Some(hi)) = (e.lowest, e.highest) {
                 ui.strong("Error extent");
@@ -875,20 +906,22 @@ impl ManagerApp {
         if e.count > 0 {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label("Suggested bad range, margin");
+                ui.label("Suggested bad range(s), margin");
                 ui.add(egui::DragValue::new(&mut self.mt.suggest_margin_mib).range(0..=4096).suffix(" MiB"));
             });
-            if let Some(s) = e.suggested_range(self.mt.suggest_margin_mib * MIB, MIB) {
-                ui.horizontal(|ui| {
-                    ui.monospace(format!("range {:#x} {:#x}   ({})", s.start(), s.end(), report::size(s.len())));
-                    if ui.button("Use in Configuration").on_hover_text("Replaces the ranges in the Configuration tab; review and Apply there.").clicked() {
-                        self.editor.rows = vec![RangeRow { start: format!("{:#x}", s.start()), end: format!("{:#x}", s.end()) }];
-                        self.editor.source = "suggested by memory test (not applied yet)".into();
-                        self.tab = Tab::Config;
-                    }
-                });
-                if !protected.iter().any(|p| p.start() <= s.start() && s.end() <= p.end()) {
-                    ui.colored_label(level_color(Level::Warn), "⚠ The configured bad range does not cover all errors plus margin.");
+            let suggested = self.suggested(e);
+            for s in &suggested {
+                ui.monospace(format!("range {:#x} {:#x}   ({})", s.start(), s.end(), report::size(s.len())));
+            }
+            if !suggested.is_empty() {
+                if ui.button("Use in Configuration").on_hover_text("Replaces the ranges in the Configuration tab; review and Apply there.").clicked() {
+                    self.editor.rows = suggested.iter().map(|s| RangeRow { start: format!("{:#x}", s.start()), end: format!("{:#x}", s.end()) }).collect();
+                    self.editor.source = "suggested by memory test (not applied yet)".into();
+                    self.tab = Tab::Config;
+                }
+                let covered = suggested.iter().all(|s| protected.iter().any(|p| p.start() <= s.start() && s.end() <= p.end()));
+                if !covered && !protected.is_empty() {
+                    ui.colored_label(level_color(Level::Warn), "⚠ The configured bad ranges do not cover all errors plus margin.");
                 }
             }
             egui::CollapsingHeader::new(format!("First {} error(s)", e.samples.len().min(200))).show(ui, |ui| {
@@ -898,13 +931,311 @@ impl ManagerApp {
                 }
             });
         }
-        if !r.untested.is_empty() {
-            egui::CollapsingHeader::new(format!("Untested regions ({})", r.untested.len())).show(ui, |ui| {
-                for u in &r.untested {
+        let skipped: Vec<_> = r.untested.iter().filter(|u| !is_not_ram(u)).collect();
+        if !skipped.is_empty() {
+            egui::CollapsingHeader::new(format!("Untested regions ({})", skipped.len())).show(ui, |ui| {
+                for u in skipped {
                     ui.monospace(format!("{}  {}", u.range, u.reason));
                 }
             });
         }
+    }
+
+    fn suggested(&self, e: &badram_core::memtest::ErrorLog) -> Vec<Range> {
+        e.suggested_ranges(self.mt.suggest_margin_mib * MIB, MIB, badram_core::memtest::SUGGEST_GAP)
+    }
+
+    fn efi_label(&self) -> String {
+        match &self.efi {
+            Some(ops::EfiSource::Embedded) => format!("built-in (bundled with BadRAM Manager {})", env!("CARGO_PKG_VERSION")),
+            Some(ops::EfiSource::File(p)) => p.display().to_string(),
+            None => "not selected".into(),
+        }
+    }
+
+    fn efi_picker(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("badram.efi:");
+            if paths::EMBEDDED_EFI.is_some() {
+                ui.radio_value(&mut self.efi, Some(ops::EfiSource::Embedded), "built-in");
+            }
+            if let Some(ops::EfiSource::File(p)) = &self.efi {
+                ui.label(p.display().to_string());
+            }
+            if ui.button("Choose file…").clicked()
+                && let Some(p) = rfd::FileDialog::new().add_filter("EFI application", &["efi"]).pick_file()
+            {
+                self.efi = Some(ops::EfiSource::File(p));
+            }
+        });
+    }
+
+    // ----------------------------------------------------------------- Setup
+
+    fn setup_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(s) = self.status.clone() else {
+            ui.spinner();
+            return;
+        };
+        if !self.mt.loaded_once && s.elevated && s.installed() {
+            self.load_test_files(ui.ctx());
+        }
+        let busy = self.busy();
+        let verdict = s.verdict();
+        let installed_cfg = sysstatus::load_installed_config().and_then(Result::ok);
+        let protect_configured = installed_cfg.as_ref().is_some_and(|c| c.mode == Mode::Protect);
+        let files = self.mt.files.as_ref().and_then(|f| f.as_ref().ok()).cloned();
+        let pending = files.as_ref().is_some_and(|f| f.pending);
+        let result = files.as_ref().and_then(|f| f.result.clone()).and_then(Result::ok);
+
+        ui.heading("Set up BadRAM");
+        ui.label(
+            "BadRAM keeps Windows away from damaged memory. Follow the steps in order; each \
+             step checks itself and turns green when it is done.",
+        );
+        ui.add_space(8.0);
+
+        // ---- Step 1: prepare
+        let bl_on = s.bitlocker.as_deref() == Some("On");
+        let sb_on = s.secure_boot == Some(true);
+        let prepared = s.elevated && s.uefi == Some(true) && !sb_on && !bl_on && s.fast_startup != Some(true);
+        step_header(ui, 1, "Prepare this PC", prepared);
+        ui.indent("step1", |ui| {
+            if !s.elevated {
+                ui.colored_label(level_color(Level::Bad), "BadRAM Manager needs administrator rights.");
+                if ui.button("Restart as administrator").clicked() && crate::win::relaunch_elevated("") {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                return;
+            }
+            if s.uefi == Some(false) {
+                ui.colored_label(level_color(Level::Bad),
+                    "This PC starts Windows in the old \"legacy BIOS\" mode. BadRAM only works with UEFI, \
+                     so it cannot be used on this PC.");
+                return;
+            }
+            check_line(ui, Level::Good, "Windows starts in UEFI mode.");
+
+            if bl_on {
+                check_line(ui, Level::Warn, "BitLocker drive encryption is on.");
+                ui.label(
+                    "Changing how the PC starts (the next items) makes BitLocker ask for its 48-digit \
+                     recovery key at startup. Save the key first, then pause BitLocker for two restarts.",
+                );
+                if ui.button("Show my recovery key").clicked() {
+                    self.setup.recovery_keys = Some(ops::bitlocker_recovery_keys());
+                }
+                match &self.setup.recovery_keys {
+                    Some(Ok(keys)) => {
+                        for k in keys.clone() {
+                            ui.horizontal(|ui| {
+                                ui.monospace(RichText::new(&k).size(15.0).strong());
+                                if ui.small_button("Copy").clicked() {
+                                    ui.ctx().copy_text(k.clone());
+                                }
+                            });
+                        }
+                        ui.label(RichText::new("Write it on paper or save it on another device (not only on this PC).").weak());
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(level_color(Level::Bad), e);
+                    }
+                    None => {}
+                }
+                ui.checkbox(&mut self.setup.key_saved, "I have saved my recovery key somewhere else");
+                if ui.add_enabled(self.setup.key_saved && !busy, egui::Button::new("Pause BitLocker for the next 2 restarts")).clicked() {
+                    self.start_job(ui.ctx(), "Suspend BitLocker", ops::suspend_bitlocker);
+                }
+            } else {
+                check_line(ui, Level::Good, match s.bitlocker.as_deref() {
+                    Some(_) => "BitLocker is off or paused.",
+                    None => "BitLocker is not in use (or its state is unknown).",
+                });
+            }
+
+            if sb_on {
+                check_line(ui, Level::Bad, "Secure Boot is on and must be turned off.");
+                ui.label(
+                    "badram.efi is not signed by Microsoft, so the PC refuses to start it while Secure Boot \
+                     is on. Turning it off is done in the PC's firmware settings (often called BIOS):",
+                );
+                ui.label("  1. Click the button below. The PC restarts into its firmware settings.");
+                ui.label("  2. Find \"Secure Boot\" (usually under Security, Boot or Authentication).");
+                ui.label("  3. Set it to Disabled (some PCs: set \"OS Type\" to \"Other OS\").");
+                ui.label("  4. Save and exit (usually F10). Windows starts again; open BadRAM Manager.");
+                let resp = ui.add_enabled(!bl_on && !busy, egui::Button::new("Restart into firmware settings…"));
+                if bl_on {
+                    resp.on_disabled_hover_text("Save the BitLocker recovery key and pause BitLocker first.");
+                } else if resp.clicked() {
+                    self.confirm = Some(Confirm::RestartFirmware);
+                }
+            } else if s.secure_boot == Some(false) {
+                check_line(ui, Level::Good, "Secure Boot is off.");
+            }
+
+            if s.fast_startup == Some(true) {
+                check_line(ui, Level::Warn, "Fast Startup is on (Windows can then skip BadRAM when starting).");
+                if ui.add_enabled(!busy, egui::Button::new("Turn off Fast Startup")).clicked() {
+                    self.start_job(ui.ctx(), "Turn off Fast Startup", ops::disable_hibernation);
+                }
+            } else {
+                check_line(ui, Level::Good, "Fast Startup is off.");
+            }
+        });
+        ui.add_space(10.0);
+
+        // ---- Step 2: find the bad memory
+        let found = result.as_ref().is_some_and(|r| r.completed) || protect_configured;
+        step_header(ui, 2, "Find the bad memory", found);
+        ui.indent("step2", |ui| {
+            if !prepared && !found {
+                ui.label(RichText::new("Finish step 1 first.").weak());
+                return;
+            }
+            if pending {
+                check_line(ui, Level::Warn, "A memory scan is scheduled for the next restart.");
+                ui.label(
+                    "Restart now. Before Windows starts, BadRAM tests the memory (this takes a few minutes; \
+                     press Esc to stop it), then Windows starts by itself. Open BadRAM Manager again afterwards.",
+                );
+                if ui.add_enabled(!busy, egui::Button::new(RichText::new("Restart now…").strong())).clicked() {
+                    self.confirm = Some(Confirm::Restart);
+                }
+                return;
+            }
+            if let Some(r) = &result {
+                let e = &r.errors;
+                if e.count == 0 {
+                    check_line(ui, Level::Good, &format!(
+                        "The scan found no errors in {}.", report::size(r.tested_bytes())));
+                    ui.label(RichText::new(
+                        "If you still suspect bad memory, scan again with more passes, or use MemTest86.").weak());
+                } else {
+                    check_line(ui, Level::Bad, &format!(
+                        "The scan found {} error(s) between {:#x} and {:#x}.",
+                        e.count, e.lowest.unwrap_or(0), e.highest.unwrap_or(0)));
+                }
+                if !r.completed {
+                    check_line(ui, Level::Warn, "The scan was stopped before it finished.");
+                }
+            } else if protect_configured {
+                check_line(ui, Level::Good, "Bad ranges are already configured.");
+            } else {
+                ui.label(
+                    "BadRAM can test all memory before Windows starts. This does not change anything \
+                     yet: it only finds out where the damaged memory is.",
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.label("Passes:");
+                ui.add(egui::DragValue::new(&mut self.setup.passes).range(1..=badram_core::memtest::MAX_PASSES));
+                ui.label(RichText::new("1 is quick; 3+ finds weak memory more reliably").weak());
+            });
+            let label = if result.is_some() { "Scan again at next restart" } else { "Scan all memory at next restart" };
+            let can = prepared && self.efi.is_some() && !busy;
+            if ui.add_enabled(can, egui::Button::new(RichText::new(label).strong())).clicked() {
+                let scan = ops::full_scan_range(
+                    s.windows_ranges.as_deref().unwrap_or(&[]),
+                    &s.protected_ranges(),
+                    s.installed_mem,
+                );
+                let efi = self.efi.clone().unwrap_or(ops::EfiSource::Embedded);
+                let passes = self.setup.passes;
+                self.start_job(ui.ctx(), "Schedule memory scan", move |log| {
+                    ops::start_first_scan(efi, scan, passes, false, log)
+                });
+            }
+            if self.efi.is_none() {
+                self.efi_picker(ui);
+            }
+            ui.add_space(4.0);
+            ui.label(RichText::new(
+                "Already know the bad addresses (for example from MemTest86)? Enter them in the \
+                 Configuration tab and install from the Install tab instead.").weak());
+        });
+        ui.add_space(10.0);
+
+        // ---- Step 3: protect
+        let protected_now = verdict == Verdict::Protected;
+        step_header(ui, 3, "Protect the bad memory", protect_configured);
+        ui.indent("step3", |ui| {
+            if let Some(cfg) = installed_cfg.as_ref().filter(|c| c.mode == Mode::Protect) {
+                let ranges = range::normalize(&cfg.ranges).unwrap_or_default();
+                check_line(ui, Level::Good, &format!("Protecting {} range(s):", ranges.len()));
+                for r in &ranges {
+                    ui.monospace(format!("  {r}  ({})", report::size(r.len())));
+                }
+            }
+            let Some(r) = result.as_ref().filter(|r| r.errors.count > 0) else {
+                if !protect_configured {
+                    ui.label(RichText::new("Finish step 2 first. Nothing needs protecting if no errors are found.").weak());
+                }
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.label("Safety margin around the errors:");
+                ui.add(egui::DragValue::new(&mut self.mt.suggest_margin_mib).range(0..=4096).suffix(" MiB"));
+            });
+            let suggested = self.suggested(&r.errors);
+            let total: u64 = suggested.iter().map(Range::len).sum();
+            let current = if protect_configured {
+                installed_cfg.as_ref().map(|c| range::normalize(&c.ranges).unwrap_or_default()).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let covered = !current.is_empty()
+                && suggested.iter().all(|x| current.iter().any(|p| p.start() <= x.start() && x.end() <= p.end()));
+            ui.label(if covered {
+                format!("The errors found, plus the margin, span {} in {} range(s):", report::size(total), suggested.len())
+            } else {
+                format!("BadRAM will reserve {} in {} range(s):", report::size(total), suggested.len())
+            });
+            for x in &suggested {
+                ui.monospace(format!("  {x}  ({})", report::size(x.len())));
+            }
+            if covered {
+                // Never nudge towards shrinking a working setup: that needs
+                // more passes and a deliberate choice (Configuration tab).
+                check_line(ui, Level::Good, "The protected ranges already cover every error found, plus the margin.");
+                return;
+            }
+            if protect_configured {
+                check_line(ui, Level::Warn, "Some errors are outside the protected ranges.");
+            }
+            let label = if protect_configured { "Protect these ranges instead" } else { "Protect these ranges" };
+            if ui.add_enabled(s.installed() && !busy && !suggested.is_empty(), egui::Button::new(RichText::new(label).strong())).clicked() {
+                self.start_job(ui.ctx(), "Protect bad memory", move |log| ops::protect_ranges(&suggested, log));
+            }
+        });
+        ui.add_space(10.0);
+
+        // ---- Step 4: verify
+        step_header(ui, 4, "Check that it works", protected_now);
+        ui.indent("step4", |ui| {
+            if protected_now {
+                let pages = s.badram.as_ref().map_or(0, |i| i.pages);
+                check_line(ui, Level::Good, &format!(
+                    "Done. {} of damaged memory was reserved before Windows started, and Windows does not use it.",
+                    report::size(pages * PAGE_SIZE)));
+                if matches!(s.truncatememory, Ok(Some(_))) {
+                    check_line(ui, Level::Warn, "An old memory limit is still set, so Windows ignores some good memory.");
+                    if ui.add_enabled(!busy, egui::Button::new("Remove the old memory limit…")).clicked() {
+                        self.confirm = Some(Confirm::RemoveLimit);
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(
+                    "Later: if a message says this start was not protected, restart as it asks. After a BIOS \
+                     update or a memory change, scan again.").weak());
+            } else if protect_configured {
+                ui.label("Restart to switch the protection on, then open BadRAM Manager again to check.");
+                if ui.add_enabled(!busy, egui::Button::new("Restart now…")).clicked() {
+                    self.confirm = Some(Confirm::Restart);
+                }
+            } else {
+                ui.label(RichText::new("Finish step 3 first.").weak());
+            }
+        });
     }
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {
@@ -948,6 +1279,7 @@ impl eframe::App for ManagerApp {
                 }
             });
             ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Setup, "Setup");
                 ui.selectable_value(&mut self.tab, Tab::Status, "Status");
                 ui.selectable_value(&mut self.tab, Tab::Config, "Configuration");
                 ui.selectable_value(&mut self.tab, Tab::MemTest, "Memory Test");
@@ -965,6 +1297,7 @@ impl eframe::App for ManagerApp {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                 Tab::Status => self.status_tab(ui),
+                Tab::Setup => self.setup_tab(ui),
                 Tab::Config => self.config_tab(ui),
                 Tab::MemTest => self.memtest_tab(ui),
                 Tab::Install => self.install_tab(ui),
@@ -973,6 +1306,26 @@ impl eframe::App for ManagerApp {
 
         self.confirm_dialog(&ctx);
     }
+}
+
+fn step_header(ui: &mut egui::Ui, n: u32, title: &str, done: bool) {
+    let (icon, color) = if done {
+        ("✔", level_color(Level::Good))
+    } else {
+        ("●", ui.visuals().strong_text_color())
+    };
+    ui.label(RichText::new(format!("{icon}  Step {n}: {title}")).size(17.0).strong().color(color));
+}
+
+fn check_line(ui: &mut egui::Ui, level: Level, text: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(level_icon(level)).color(level_color(level)));
+        ui.label(text);
+    });
+}
+
+fn is_not_ram(u: &badram_core::memtest::Untested) -> bool {
+    u.reason == "not in memory map"
 }
 
 /// Error histogram over the requested span, with tested/untested strips and
@@ -999,7 +1352,7 @@ fn histogram(ui: &mut egui::Ui, r: &badram_core::memtest::TestResult, protected:
     for t in &r.tested {
         p.rect_filled(band(t.start(), t.end(), bottom - 6.0, bottom), 0.0, level_color(Level::Good));
     }
-    for u in &r.untested {
+    for u in r.untested.iter().filter(|u| !is_not_ram(u)) {
         p.rect_filled(band(u.range.start(), u.range.end(), bottom - 6.0, bottom), 0.0, Color32::GRAY);
     }
     let max = r.errors.buckets.values().copied().max().unwrap_or(0).max(1) as f32;

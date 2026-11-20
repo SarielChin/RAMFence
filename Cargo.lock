@@ -394,7 +394,7 @@ version = "0.1.0"
 
 [[package]]
 name = "badram-efi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "badram-core",
  "uefi",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "badram-manager"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "badram-core",
  "eframe",

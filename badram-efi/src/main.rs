@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 
 use badram_core::config::{self, DEFAULT_TIMEOUT_SECS};
 use badram_core::range::{self, PAGE_SIZE};
-use badram_core::{Config, MemoryType as CfgMemoryType, OnError, Range, status};
+use badram_core::{Config, MemoryType as CfgMemoryType, Mode, OnError, Range, status};
 use uefi::boot;
 use uefi::fs::FileSystem;
 use uefi::prelude::*;
@@ -73,9 +73,14 @@ fn main() -> Status {
     // also cover the configured bad ranges themselves.
     let tested = image_dir().is_ok_and(|dir| memtest::run_if_requested(&dir, &mut log));
 
+    let mode = config.as_ref().map_or(Mode::Protect, |c| c.mode);
     let mut ranges: Vec<Range> = Vec::new();
     let mut outcome = reserve::Outcome::default();
-    if let Some(cfg) = &config {
+    if mode == Mode::ScanOnly {
+        // Explicitly configured (the bad ranges are not known yet), so not
+        // an error; but say clearly that nothing is protected.
+        log.warn("scan-only mode: no memory is reserved during this boot");
+    } else if let Some(cfg) = &config {
         match range::normalize(&cfg.ranges) {
             Ok(r) => ranges = r,
             Err(e) => log.error(format_args!("{CONFIG_NAME}: {e}")),
@@ -97,6 +102,7 @@ fn main() -> Status {
         &ranges,
         outcome.protected,
         mem_type,
+        mode,
         log.first_error(),
     );
     if let Err(e) = set_status_variable(&status_text) {

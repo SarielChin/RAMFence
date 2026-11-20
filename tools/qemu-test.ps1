@@ -22,7 +22,7 @@
 #>
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('ok', 'reserved', 'missing-config', 'parse-error', 'conflict', 'halt', 'memtest')]
+    [ValidateSet('ok', 'reserved', 'missing-config', 'parse-error', 'conflict', 'halt', 'memtest', 'scan-only')]
     [string]$Case,
 
     # "0xSTART 0xEND" for the conflict/halt cases: pick a BS_Data region
@@ -84,6 +84,13 @@ $Cases = @{
         # (must be reported as untested). The reservation must be unaffected.
         Cfg     = "$TestRanges`non_error boot`ntimeout 0`nchainload $Missing`n"
         TestReq = "scan 0x3C000000 0x4C000000`nscan 0x800000 0x1800000`npasses 1`n"
+        Keys    = @()
+    }
+    'scan-only'      = @{
+        # First-time setup: nothing reserved, scheduled scan runs, status
+        # says mode=scan-only.
+        Cfg     = "mode scan-only`non_error boot`ntimeout 0`nchainload $Missing`n"
+        TestReq = "scan 0x30000000 0x50000000`npasses 1`n"
         Keys    = @()
     }
     'halt'           = @{

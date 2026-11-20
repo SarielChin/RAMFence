@@ -3,14 +3,14 @@
 //! Format (ASCII, `;`-separated `key=value`):
 //!
 //! ```text
-//! version=1;ok=1;ranges=0x...-0x...,0x...-0x...;pages=N;type=unusable[;error=...]
+//! version=1;ok=1;ranges=0x...-0x...,0x...-0x...;pages=N;type=unusable[;mode=scan-only][;error=...]
 //! ```
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use crate::config::MemoryType;
+use crate::config::{MemoryType, Mode};
 use crate::range::Range;
 
 pub const STATUS_VERSION: u32 = 1;
@@ -23,6 +23,7 @@ pub fn format_status(
     ranges: &[Range],
     pages: u64,
     memory_type: MemoryType,
+    mode: Mode,
     error: Option<&str>,
 ) -> String {
     let mut s = String::new();
@@ -35,6 +36,9 @@ pub fn format_status(
         let _ = write!(s, "{r}");
     }
     let _ = write!(s, ";pages={pages};type={}", memory_type.name());
+    if mode != Mode::Protect {
+        let _ = write!(s, ";mode={}", mode.name());
+    }
     if let Some(e) = error {
         s.push_str(";error=");
         s.extend(e.chars().map(|c| match c {
@@ -55,6 +59,8 @@ pub struct StatusInfo {
     pub pages: u64,
     /// `None` if the type field is missing or unknown.
     pub memory_type: Option<MemoryType>,
+    /// badram.efi ran in scan-only mode and reserved nothing on purpose.
+    pub scan_only: bool,
     pub error: Option<String>,
 }
 
@@ -68,6 +74,7 @@ pub fn parse_status(text: &str) -> Option<StatusInfo> {
     let mut ranges = Vec::new();
     let mut pages = 0;
     let mut memory_type = None;
+    let mut scan_only = false;
     let mut error = None;
 
     for field in text.split(';') {
@@ -97,6 +104,7 @@ pub fn parse_status(text: &str) -> Option<StatusInfo> {
                     _ => None,
                 }
             }
+            "mode" => scan_only = value == Mode::ScanOnly.name(),
             "error" => error = Some(String::from(value)),
             _ => {}
         }
@@ -108,6 +116,7 @@ pub fn parse_status(text: &str) -> Option<StatusInfo> {
         ranges,
         pages,
         memory_type,
+        scan_only,
         error,
     })
 }
@@ -119,7 +128,7 @@ mod tests {
     #[test]
     fn parse_round_trips() {
         let ranges = [r(0x1000, 0x2000), r(0x5000, 0x6000)];
-        let s = format_status(false, &ranges, 2, MemoryType::Reserved, Some("x; y"));
+        let s = format_status(false, &ranges, 2, MemoryType::Reserved, Mode::Protect, Some("x; y"));
         assert_eq!(
             parse_status(&s),
             Some(StatusInfo {
@@ -128,16 +137,26 @@ mod tests {
                 ranges: ranges.to_vec(),
                 pages: 2,
                 memory_type: Some(MemoryType::Reserved),
+                scan_only: false,
                 error: Some("x, y".into()),
             })
         );
-        let ok = format_status(true, &[r(0x1000, 0x2000)], 1, MemoryType::Unusable, None);
+        let ok = format_status(true, &[r(0x1000, 0x2000)], 1, MemoryType::Unusable, Mode::Protect, None);
         let mut with_nul = ok.clone();
         with_nul.push('\0');
         let parsed = parse_status(&with_nul).unwrap();
         assert!(parsed.ok);
         assert_eq!(parsed.error, None);
         assert_eq!(parse_status(&ok), Some(parsed));
+    }
+
+    #[test]
+    fn scan_only_mode_round_trips() {
+        let s = format_status(true, &[], 0, MemoryType::Unusable, Mode::ScanOnly, None);
+        assert_eq!(s, "version=1;ok=1;ranges=;pages=0;type=unusable;mode=scan-only");
+        let info = parse_status(&s).unwrap();
+        assert!(info.scan_only && info.ok && info.ranges.is_empty());
+        assert!(!parse_status("version=1;ok=1").unwrap().scan_only);
     }
 
     #[test]
@@ -157,7 +176,7 @@ mod tests {
     #[test]
     fn ok_single_range() {
         assert_eq!(
-            format_status(true, &[r(0x1_0000_0000, 0x1_1000_0000)], 65536, MemoryType::Unusable, None),
+            format_status(true, &[r(0x1_0000_0000, 0x1_1000_0000)], 65536, MemoryType::Unusable, Mode::Protect, None),
             "version=1;ok=1;ranges=0x100000000-0x110000000;pages=65536;type=unusable"
         );
     }
@@ -170,6 +189,7 @@ mod tests {
                 &[r(0x1000, 0x2000), r(0x5000, 0x6000)],
                 1,
                 MemoryType::Reserved,
+                Mode::Protect,
                 Some("BootServicesData at 0x5000; cannot allocate\n")
             ),
             "version=1;ok=0;ranges=0x1000-0x2000,0x5000-0x6000;pages=1;type=reserved;\
@@ -180,7 +200,7 @@ mod tests {
     #[test]
     fn no_ranges() {
         assert_eq!(
-            format_status(false, &[], 0, MemoryType::Unusable, Some("config missing")),
+            format_status(false, &[], 0, MemoryType::Unusable, Mode::Protect, Some("config missing")),
             "version=1;ok=0;ranges=;pages=0;type=unusable;error=config missing"
         );
     }

@@ -66,6 +66,10 @@ pub fn headline(s: &SystemStatus) -> (Level, String) {
                 .into(),
         ),
         Verdict::Problem(p) => (Level::Bad, p),
+        Verdict::ScanOnly => (
+            Level::Warn,
+            "Scan-only mode: BadRAM can test memory but protects nothing yet. Finish the Setup tab.".into(),
+        ),
         Verdict::NotInstalled => (Level::Info, "BadRAM is not installed.".into()),
         Verdict::Unknown(u) => (Level::Warn, format!("Status unknown: {u}")),
     }
@@ -137,7 +141,11 @@ pub fn rows(s: &SystemStatus) -> Vec<Row> {
     v.push(match &s.badram_raw {
         Ok(Some(raw)) => row(
             "BadRamStatus",
-            if s.badram.as_ref().is_some_and(|i| i.ok) { Level::Good } else { Level::Bad },
+            match &s.badram {
+                Some(i) if i.ok && i.scan_only => Level::Warn,
+                Some(i) if i.ok => Level::Good,
+                _ => Level::Bad,
+            },
             raw.clone(),
         ),
         Ok(None) => row(

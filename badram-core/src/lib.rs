@@ -17,6 +17,6 @@ pub mod memtest;
 pub mod range;
 pub mod status;
 
-pub use config::{Config, MemoryType, OnError, ParseError, ParseErrorKind};
+pub use config::{Config, MemoryType, Mode, OnError, ParseError, ParseErrorKind};
 pub use memmap::{Class, MemDesc, Plan, Segment};
 pub use range::{PAGE_SIZE, Range, RangeError};

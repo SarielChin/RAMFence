@@ -69,10 +69,31 @@ impl OnError {
     }
 }
 
+/// What badram.efi does with the configured ranges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Reserve the configured ranges (the normal mode).
+    #[default]
+    Protect,
+    /// Reserve nothing: only run a scheduled memory test, then boot. Used
+    /// to find the bad ranges on a new machine. Takes no `range` lines.
+    ScanOnly,
+}
+
+impl Mode {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Mode::Protect => "protect",
+            Mode::ScanOnly => "scan-only",
+        }
+    }
+}
+
 pub const DEFAULT_TIMEOUT_SECS: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
+    pub mode: Mode,
     /// Ranges exactly as written (not yet aligned or merged; see
     /// [`crate::range::normalize`]).
     pub ranges: Vec<Range>,
@@ -104,8 +125,10 @@ pub enum ParseErrorKind {
     /// `chainload` path must start with `\`.
     InvalidPath(String),
     Range(RangeError),
-    /// The file contains no `range` line.
+    /// The file contains no `range` line (and the mode is `protect`).
     NoRanges,
+    /// `range` lines are not allowed with `mode scan-only`.
+    RangesInScanOnly,
 }
 
 impl fmt::Display for ParseError {
@@ -133,6 +156,9 @@ impl fmt::Display for ParseError {
             }
             ParseErrorKind::Range(e) => write!(f, "{e}"),
             ParseErrorKind::NoRanges => write!(f, "no 'range' line found"),
+            ParseErrorKind::RangesInScanOnly => {
+                write!(f, "'range' lines are not allowed with 'mode scan-only'")
+            }
         }
     }
 }
@@ -145,6 +171,7 @@ pub fn parse(text: &str) -> Result<Config, ParseError> {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
 
     let mut ranges = Vec::new();
+    let mut mode = None;
     let mut memory_type = None;
     let mut on_error = None;
     let mut timeout_secs = None;
@@ -178,6 +205,15 @@ pub fn parse(text: &str) -> Result<Config, ParseError> {
                 // Reject now so the user sees the line number.
                 r.align_outward().map_err(|e| err(ParseErrorKind::Range(e)))?;
                 ranges.push(r);
+            }
+            "mode" => {
+                expect_args("mode", &args, 1).map_err(err)?;
+                let v = match_value("mode", args[0], &[
+                    ("protect", Mode::Protect),
+                    ("scan-only", Mode::ScanOnly),
+                ])
+                .map_err(err)?;
+                set_once("mode", &mut mode, v).map_err(err)?;
             }
             "memory_type" => {
                 expect_args("memory_type", &args, 1).map_err(err)?;
@@ -223,14 +259,16 @@ pub fn parse(text: &str) -> Result<Config, ParseError> {
         }
     }
 
-    if ranges.is_empty() {
-        return Err(ParseError {
-            line: 0,
-            kind: ParseErrorKind::NoRanges,
-        });
+    let mode = mode.unwrap_or_default();
+    let whole_file = |kind| Err(ParseError { line: 0, kind });
+    match mode {
+        Mode::Protect if ranges.is_empty() => return whole_file(ParseErrorKind::NoRanges),
+        Mode::ScanOnly if !ranges.is_empty() => return whole_file(ParseErrorKind::RangesInScanOnly),
+        _ => {}
     }
 
     Ok(Config {
+        mode,
         ranges,
         memory_type: memory_type.unwrap_or_default(),
         on_error: on_error.unwrap_or_default(),
@@ -279,7 +317,11 @@ impl Config {
     pub fn to_text(&self) -> String {
         use core::fmt::Write;
         let mut s = String::new();
-        // Writing to a String cannot fail.
+        // Writing to a String cannot fail. `mode protect` is the default
+        // and is omitted, so older badram.efi builds still parse the file.
+        if self.mode != Mode::Protect {
+            let _ = writeln!(s, "mode {}", self.mode.name());
+        }
         for r in &self.ranges {
             let _ = writeln!(s, "range {:#x} {:#x}", r.start(), r.end());
         }
@@ -346,6 +388,7 @@ chainload \\EFI\\Some Dir\\shell.efi
         assert_eq!(
             c,
             Config {
+                mode: Mode::Protect,
                 ranges: vec![r(0x1_0000_0000, 0x1_1000_0000), r(0x2_0000_0000, 0x2_0000_1000)],
                 memory_type: MemoryType::Reserved,
                 on_error: OnError::Halt,
@@ -509,6 +552,7 @@ chainload \\EFI\\Some Dir\\shell.efi
     #[test]
     fn to_text_round_trips() {
         let original = Config {
+            mode: Mode::Protect,
             ranges: vec![r(0x1234, 0x5678), r(0x1_0000_0000, 0x1_1000_0000)],
             memory_type: MemoryType::Reserved,
             on_error: OnError::Halt,
@@ -525,6 +569,23 @@ chainload \\EFI\\Some Dir\\shell.efi
 
         let minimal = parse("range 0x1000 0x2000").unwrap();
         assert_eq!(parse(&minimal.to_text()), Ok(minimal));
+    }
+
+    #[test]
+    fn scan_only_mode() {
+        let c = parse("mode scan-only\non_error boot\n").unwrap();
+        assert_eq!(c.mode, Mode::ScanOnly);
+        assert!(c.ranges.is_empty());
+        assert_eq!(c.to_text(), "mode scan-only\nmemory_type unusable\non_error boot\ntimeout 3\n");
+        assert_eq!(parse(&c.to_text()), Ok(c));
+
+        assert_eq!(kind("mode scan-only\nrange 0x1000 0x2000"), (0, ParseErrorKind::RangesInScanOnly));
+        assert_eq!(kind("mode protect"), (0, ParseErrorKind::NoRanges));
+        assert_eq!(parse("mode protect\nrange 0x1000 0x2000").unwrap().mode, Mode::Protect);
+        assert_eq!(kind("range 0x1000 0x2000\nmode x"), (2, ParseErrorKind::InvalidValue { key: "mode", value: "x".into() }));
+        assert_eq!(kind("mode protect\nmode protect\nrange 0x1000 0x2000"), (2, ParseErrorKind::DuplicateKey("mode")));
+        // Protect is implicit, so files stay readable by older builds.
+        assert!(!parse("range 0x1000 0x2000").unwrap().to_text().contains("mode"));
     }
 
     #[test]

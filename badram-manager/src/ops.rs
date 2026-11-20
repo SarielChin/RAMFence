@@ -58,18 +58,46 @@ fn write(to: &Path, text: &str) -> Result<(), String> {
     fs::write(to, text).map_err(|e| format!("cannot write {}: {e}", to.display()))
 }
 
-fn check_efi_file(path: &Path) -> Result<(), String> {
-    let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    if bytes.len() < 1024 || !bytes.starts_with(b"MZ") {
-        return Err(format!("{} does not look like an EFI executable", path.display()));
+fn write_bytes(to: &Path, bytes: &[u8]) -> Result<(), String> {
+    fs::write(to, bytes).map_err(|e| format!("cannot write {}: {e}", to.display()))
+}
+
+/// Where the badram.efi to install comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EfiSource {
+    /// The copy bundled into this executable.
+    Embedded,
+    File(PathBuf),
+}
+
+impl EfiSource {
+    /// The default: the bundled copy, else a badram.efi found on disk.
+    pub fn default_source() -> Option<EfiSource> {
+        if paths::EMBEDDED_EFI.is_some() {
+            Some(EfiSource::Embedded)
+        } else {
+            paths::find_efi().map(EfiSource::File)
+        }
     }
-    Ok(())
+
+    pub fn load(&self) -> Result<Vec<u8>, String> {
+        let bytes = match self {
+            EfiSource::Embedded => paths::EMBEDDED_EFI
+                .ok_or("this build has no embedded badram.efi")?
+                .to_vec(),
+            EfiSource::File(p) => fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?,
+        };
+        if bytes.len() < 1024 || !bytes.starts_with(b"MZ") {
+            return Err("the selected badram.efi does not look like an EFI executable".into());
+        }
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct InstallOptions {
     pub config_text: String,
-    pub efi: PathBuf,
+    pub efi: EfiSource,
     pub suspend_bitlocker: bool,
     pub allow_secure_boot: bool,
 }
@@ -81,11 +109,12 @@ pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
     }
     let (cfg, ranges) = validate_config(&o.config_text)?;
     log(format!(
-        "Config OK: {} range(s), {} pages",
+        "Config OK: mode {}, {} range(s), {} pages",
+        cfg.mode.name(),
         ranges.len(),
         range::total_pages(&ranges)
     ));
-    check_efi_file(&o.efi)?;
+    let efi = o.efi.load()?;
 
     let status = sysstatus::collect();
     if status.secure_boot == Some(true) && !o.allow_secure_boot {
@@ -100,16 +129,7 @@ pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
                         (manage-bde -protectors -get C:), then tick \"Suspend BitLocker\"."
                 .into());
         }
-        log("Suspending BitLocker for 2 reboots".into());
-        win::run_ok(
-            "powershell.exe",
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 2 | Out-Null",
-            ],
-        )?;
+        suspend_bitlocker(log)?;
     }
     if status.fast_startup == Some(true) {
         log("Warning: Fast Startup is on; a resume from hibernation skips badram.efi \
@@ -123,7 +143,7 @@ pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
     if let Ok(me) = std::env::current_exe() {
         copy(&me, &dir.join(EXE_NAME))?;
     }
-    copy(&o.efi, &dir.join(EFI_NAME))?;
+    write_bytes(&dir.join(EFI_NAME), &efi)?;
     write(&dir.join(CFG_NAME), &cfg_text)?;
     let backup = dir.join(format!("BCD-backup-{}", win::local_timestamp().replace(':', "")));
     bcd::export(&backup.to_string_lossy())?;
@@ -132,7 +152,7 @@ pub fn install(o: &InstallOptions, log: Log) -> Result<(), String> {
     esp::with_esp(|root| {
         let esp_dir = root.join(ESP_DIR);
         fs::create_dir_all(&esp_dir).map_err(|e| format!("cannot create {}: {e}", esp_dir.display()))?;
-        copy(&o.efi, &esp_dir.join(EFI_NAME))?;
+        write_bytes(&esp_dir.join(EFI_NAME), &efi)?;
         write(&esp_dir.join(CFG_NAME), &cfg_text)?;
         if !root.join(r"EFI\Microsoft\Boot\bootmgfw.efi").is_file() {
             log("Warning: bootmgfw.efi not found on this ESP; badram.efi will search other volumes.".into());
@@ -337,6 +357,117 @@ pub fn restart_now(log: Log) -> Result<(), String> {
     win::run_ok("shutdown.exe", &["/r", "/t", "0"]).map(drop)
 }
 
+/// Restarts straight into the firmware (BIOS/UEFI) setup screen.
+pub fn restart_to_firmware(log: Log) -> Result<(), String> {
+    log("Restarting into the firmware settings…".into());
+    win::run_ok("shutdown.exe", &["/r", "/fw", "/t", "0"]).map(drop)
+}
+
+pub fn suspend_bitlocker(log: Log) -> Result<(), String> {
+    require_admin()?;
+    win::run_ok(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 2 | Out-Null",
+        ],
+    )?;
+    log("BitLocker suspended for the next 2 restarts (it resumes by itself).".into());
+    Ok(())
+}
+
+pub fn disable_hibernation(log: Log) -> Result<(), String> {
+    require_admin()?;
+    win::run_ok("powercfg.exe", &["/h", "off"])?;
+    log("Hibernation and Fast Startup turned off.".into());
+    Ok(())
+}
+
+/// BitLocker recovery passwords (48 digits in 8 groups) of the system drive.
+pub fn bitlocker_recovery_keys() -> Result<Vec<String>, String> {
+    require_admin()?;
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let out = win::run_ok("manage-bde.exe", &["-protectors", "-get", &drive, "-Type", "RecoveryPassword"])?;
+    let keys = find_recovery_passwords(&out);
+    if keys.is_empty() {
+        Err("no BitLocker recovery password found on the system drive".into())
+    } else {
+        Ok(keys)
+    }
+}
+
+/// Finds `dddddd-dddddd-…` (8 groups of 6 digits) in localized tool output.
+pub fn find_recovery_passwords(text: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for token in text.split_whitespace() {
+        let groups: Vec<&str> = token.split('-').collect();
+        if groups.len() == 8 && groups.iter().all(|g| g.len() == 6 && g.bytes().all(|b| b.is_ascii_digit())) {
+            keys.push(token.to_string());
+        }
+    }
+    keys.dedup();
+    keys
+}
+
+/// Config text for the first-time scan: reserve nothing.
+pub fn scan_only_config_text() -> String {
+    Config {
+        mode: badram_core::Mode::ScanOnly,
+        ranges: Vec::new(),
+        memory_type: badram_core::MemoryType::Unusable,
+        on_error: badram_core::OnError::Prompt,
+        timeout_secs: config::DEFAULT_TIMEOUT_SECS,
+        chainload: None,
+    }
+    .to_text()
+}
+
+/// One scan range covering all RAM: from 1 MiB to past the highest address
+/// any source knows about. Parts that are not RAM are skipped (and listed
+/// as "not in memory map") by badram.efi.
+pub fn full_scan_range(windows: &[Range], protected: &[Range], installed_bytes: Option<u64>) -> Range {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    let known_max = windows.iter().chain(protected).map(Range::end).max().unwrap_or(0);
+    // With a memory limit (truncatememory), Windows does not report RAM
+    // above the limit; installed RAM plus a 4 GiB MMIO hole bounds it.
+    let from_installed = installed_bytes.map_or(0, |b| b.saturating_add(4 * GIB));
+    let end = known_max.max(from_installed).max(GIB).div_ceil(GIB) * GIB;
+    Range::new(MIB, end).expect("end >= 1 GiB > 1 MiB")
+}
+
+/// First-time setup, step "find bad memory": installs in scan-only mode if
+/// BadRAM is not installed yet, then schedules a scan of `scan`.
+pub fn start_first_scan(efi: EfiSource, scan: Range, passes: u32, allow_secure_boot: bool, log: Log) -> Result<(), String> {
+    if state::load().is_none() {
+        install(
+            &InstallOptions {
+                config_text: scan_only_config_text(),
+                efi,
+                suspend_bitlocker: false,
+                allow_secure_boot,
+            },
+            log,
+        )?;
+    }
+    let req = memtest::TestRequest { ranges: vec![scan], passes };
+    schedule_test(&req.to_text(), log)
+}
+
+/// Writes a protect-mode config with `ranges` to the installation (keeping
+/// the other settings of the installed config).
+pub fn protect_ranges(ranges: &[Range], log: Log) -> Result<(), String> {
+    let mut cfg = match sysstatus::load_installed_config() {
+        Some(Ok(c)) => c,
+        _ => config::parse(&scan_only_config_text()).map_err(|e| e.to_string())?,
+    };
+    cfg.mode = badram_core::Mode::Protect;
+    cfg.ranges = ranges.to_vec();
+    apply_config(&cfg.to_text(), log)
+}
+
 fn append_check_log(line: &str) {
     use std::io::Write;
     let line = format!("{}  {line}\r\n", win::local_timestamp());
@@ -400,6 +531,10 @@ pub fn run_check() -> i32 {
             }
             0
         }
+        Verdict::ScanOnly => {
+            append_check_log("Scan-only mode (setup not finished): nothing is reserved");
+            0
+        }
         Verdict::NotProtected | Verdict::NotInstalled => {
             append_check_log("NOT PROTECTED: BadRamStatus variable missing");
             win::message_box(
@@ -443,6 +578,36 @@ mod tests {
         assert_eq!(ranges, vec![Range::new(0x1000, 0x6000).unwrap()]);
         assert!(validate_config("range 0x2000 0x1000").is_err());
         assert!(validate_config("").is_err());
+    }
+
+    #[test]
+    fn recovery_password_extraction() {
+        let out = "BitLocker Drive Encryption: Configuration Tool\r\n\
+                   Numerical Password:\r\n      ID: {01234567-89AB-CDEF-0123-456789ABCDEF}\r\n      \
+                   Password:\r\n        111111-222222-333333-444444-555555-666666-777777-888888\r\n";
+        assert_eq!(find_recovery_passwords(out), vec!["111111-222222-333333-444444-555555-666666-777777-888888"]);
+        assert!(find_recovery_passwords("123456-123456").is_empty());
+        assert!(find_recovery_passwords("12345a-222222-333333-444444-555555-666666-777777-888888").is_empty());
+    }
+
+    #[test]
+    fn scan_only_config_is_valid() {
+        let (cfg, ranges) = validate_config(&scan_only_config_text()).unwrap();
+        assert_eq!(cfg.mode, badram_core::Mode::ScanOnly);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn full_scan_range_bounds() {
+        let gib = 1u64 << 30;
+        let r = |a, b| Range::new(a, b).unwrap();
+        // Windows map tops out at 25.5 GiB: round up to 26 GiB.
+        let win = [r(0x1000, 0x9F000), r(4 * gib, 25 * gib + gib / 2)];
+        assert_eq!(full_scan_range(&win, &[], None), r(1 << 20, 26 * gib));
+        // Truncated Windows map: installed RAM + 4 GiB wins.
+        assert_eq!(full_scan_range(&[r(0x1000, 8 * gib)], &[], Some(24 * gib)), r(1 << 20, 28 * gib));
+        // Nothing known: at least 1 GiB.
+        assert_eq!(full_scan_range(&[], &[], None), r(1 << 20, gib));
     }
 
     #[test]

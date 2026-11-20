@@ -38,6 +38,9 @@ pub enum Verdict {
     Problem(String),
     /// This boot did not go through badram.efi.
     NotProtected,
+    /// badram.efi ran in scan-only mode (first-time setup): nothing is
+    /// reserved yet, on purpose.
+    ScanOnly,
     NotInstalled,
     Unknown(String),
 }
@@ -85,6 +88,7 @@ impl SystemStatus {
             (Ok(None), _) if !self.installed() => Verdict::NotInstalled,
             (Ok(None), _) => Verdict::NotProtected,
             (Ok(Some(raw)), None) => Verdict::Problem(format!("unreadable BadRamStatus: {raw}")),
+            (Ok(Some(_)), Some(info)) if info.ok && info.scan_only => Verdict::ScanOnly,
             (Ok(Some(_)), Some(info)) if !info.ok => Verdict::Problem(format!(
                 "badram.efi reported an error: {}",
                 info.error.as_deref().unwrap_or("(no details)")
@@ -222,5 +226,9 @@ mod tests {
         let mut s = base();
         s.elevated = false;
         assert!(matches!(s.verdict(), Verdict::Unknown(_)));
+
+        let mut s = base();
+        s.badram = parse_status("version=1;ok=1;ranges=;pages=0;type=unusable;mode=scan-only");
+        assert_eq!(s.verdict(), Verdict::ScanOnly);
     }
 }

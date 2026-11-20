@@ -209,6 +209,7 @@ function Save-BadRamState([string]$Id) {
 function Test-BadRamConfig([string]$Path) {
     $errors = @()
     $ranges = 0
+    $mode = 'protect'
     $n = 0
     foreach ($raw in (Get-Content $Path)) {
         $n++
@@ -225,6 +226,10 @@ function Test-BadRamConfig([string]$Path) {
                     if ($s -ge $e) { $errors += "line ${n}: start must be below end" } else { $ranges++ }
                 }
             }
+            'mode' {
+                if ($parts.Count -ne 2 -or $parts[1] -notin 'protect', 'scan-only') { $errors += "line ${n}: mode must be protect or scan-only" }
+                else { $mode = $parts[1] }
+            }
             'memory_type' { if ($parts.Count -ne 2 -or $parts[1] -notin 'unusable', 'reserved') { $errors += "line ${n}: memory_type must be unusable or reserved" } }
             'on_error' { if ($parts.Count -ne 2 -or $parts[1] -notin 'prompt', 'boot', 'halt') { $errors += "line ${n}: on_error must be prompt, boot or halt" } }
             'timeout' { if ($parts.Count -ne 2 -or $parts[1] -notmatch '^\d+$') { $errors += "line ${n}: timeout must be a number of seconds" } }
@@ -232,6 +237,7 @@ function Test-BadRamConfig([string]$Path) {
             default { $errors += "line ${n}: unknown key '$($parts[0])'" }
         }
     }
-    if ($ranges -eq 0) { $errors += "no 'range' line" }
+    if ($mode -eq 'protect' -and $ranges -eq 0) { $errors += "no 'range' line" }
+    if ($mode -eq 'scan-only' -and $ranges -gt 0) { $errors += "'range' lines are not allowed with 'mode scan-only'" }
     , $errors
 }

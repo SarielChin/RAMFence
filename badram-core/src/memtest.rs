@@ -135,15 +135,44 @@ impl ErrorLog {
         }
     }
 
-    /// Range covering every error, widened by `margin` on both sides and
+    /// Ranges to reserve: error clusters (histogram buckets closer than
+    /// `gap` are one cluster), each widened by `margin` on both sides and
     /// rounded outward to `align` (a power of two, at least a page).
-    pub fn suggested_range(&self, margin: u64, align: u64) -> Option<Range> {
+    /// Overlapping results are merged. The outermost edges use the exact
+    /// lowest/highest error address; inner edges use bucket granularity.
+    pub fn suggested_ranges(&self, margin: u64, align: u64, gap: u64) -> Vec<Range> {
+        let (Some(lowest), Some(highest)) = (self.lowest, self.highest) else {
+            return Vec::new();
+        };
+        let mut clusters: Vec<(u64, u64)> = Vec::new();
+        for &b in self.buckets.keys() {
+            let end = b.saturating_add(BUCKET_SIZE);
+            match clusters.last_mut() {
+                Some(c) if b.saturating_sub(c.1) <= gap => c.1 = end,
+                _ => clusters.push((b, end)),
+            }
+        }
+        if let Some(first) = clusters.first_mut() {
+            first.0 = first.0.max(lowest);
+        }
+        if let Some(last) = clusters.last_mut() {
+            last.1 = last.1.min(highest.saturating_add(8));
+        }
         let align = align.max(PAGE_SIZE);
-        let lo = self.lowest?.saturating_sub(margin) & !(align - 1);
-        let hi = self.highest?.checked_add(8 + margin)?.checked_add(align - 1)? & !(align - 1);
-        Range::new(lo, hi).ok()
+        let widened: Vec<Range> = clusters
+            .into_iter()
+            .filter_map(|(s, e)| {
+                let lo = s.saturating_sub(margin) & !(align - 1);
+                let hi = e.checked_add(margin)?.checked_add(align - 1)? & !(align - 1);
+                Range::new(lo, hi).ok()
+            })
+            .collect();
+        normalize(&widened).unwrap_or_default()
     }
 }
+
+/// Default gap between error clusters that still counts as one range.
+pub const SUGGEST_GAP: u64 = 1 << 30;
 
 // ------------------------------------------------------------------- result
 
@@ -560,18 +589,34 @@ mod tests {
     }
 
     #[test]
-    fn suggested_range() {
+    fn suggested_single_cluster_uses_exact_edges() {
+        let mib = 1 << 20;
         let mut log = ErrorLog::default();
-        assert_eq!(log.suggested_range(0, PAGE_SIZE), None);
+        assert!(log.suggested_ranges(0, PAGE_SIZE, SUGGEST_GAP).is_empty());
         log.record(0x1_2345_6788, 0, 1);
         log.record(0x1_3000_0010, 0, 1);
-        let mib = 1 << 20;
         assert_eq!(
-            log.suggested_range(16 * mib, mib),
-            Some(r(0x1_2245_0000 & !(mib - 1), 0x1_3110_0000))
+            log.suggested_ranges(16 * mib, mib, SUGGEST_GAP),
+            vec![r(0x1_2240_0000, 0x1_3110_0000)]
         );
         // Margin larger than the address saturates at 0.
-        assert_eq!(log.suggested_range(u64::MAX / 2, mib).unwrap().start(), 0);
+        assert_eq!(log.suggested_ranges(u64::MAX / 2, mib, SUGGEST_GAP)[0].start(), 0);
+    }
+
+    #[test]
+    fn suggested_ranges_split_distant_clusters() {
+        let mib = 1u64 << 20;
+        let gib = 1u64 << 30;
+        let mut log = ErrorLog::default();
+        log.record(gib + 0x100, 0, 1); // cluster A at 1 GiB
+        log.record(gib + 70 * mib, 0, 1); // next bucket: still A
+        log.record(10 * gib + 0x200, 0, 1); // cluster B at 10 GiB
+        let got = log.suggested_ranges(64 * mib, mib, gib);
+        assert_eq!(got, vec![r(gib - 64 * mib, gib + 192 * mib), r(10 * gib - 64 * mib, 10 * gib + 65 * mib)]);
+        // A huge gap tolerance merges them into one.
+        assert_eq!(log.suggested_ranges(64 * mib, mib, 16 * gib).len(), 1);
+        // Margins that make clusters overlap are merged.
+        assert_eq!(log.suggested_ranges(5 * gib, mib, gib).len(), 1);
     }
 
     #[test]
