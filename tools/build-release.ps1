@@ -35,11 +35,31 @@ function Invoke-Cargo {
 
 Push-Location $Root
 try {
-    Invoke-Cargo build -p ramfence-efi --target x86_64-unknown-uefi --release
     Invoke-Cargo test -p ramfence-core -p ramfence-manager
-    # Separate target dir: a running copy of target\release\ramfence-manager.exe
-    # (e.g. open for testing) would otherwise lock the output file.
-    Invoke-Cargo build -p ramfence-manager --release --target-dir target\pkg
+
+    # Release binaries are published: strip the builder's local paths (user
+    # name, checkout location) from panic locations and debug info.
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+    $savedFlags = $env:RUSTFLAGS
+    $savedEfi = $env:RAMFENCE_EFI
+    $savedStrip = $env:CARGO_PROFILE_RELEASE_STRIP
+    $env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=/cargo --remap-path-prefix=$Root=/ramfence"
+    # The GNU toolchain also leaves the build directory in import symbol names
+    # (raw-dylib via dlltool); dropping the symbol table removes those.
+    $env:CARGO_PROFILE_RELEASE_STRIP = "symbols"
+    # Separate target dir: different RUSTFLAGS would otherwise force full
+    # rebuilds of the normal dev builds, and a running copy of
+    # target\release\ramfence-manager.exe would lock the output file.
+    $efiPath = Join-Path $Root 'target\pkg\x86_64-unknown-uefi\release\ramfence.efi'
+    $env:RAMFENCE_EFI = $efiPath
+    try {
+        Invoke-Cargo build -p ramfence-efi --target x86_64-unknown-uefi --release --target-dir target\pkg
+        Invoke-Cargo build -p ramfence-manager --release --target-dir target\pkg
+    } finally {
+        $env:RUSTFLAGS = $savedFlags
+        $env:RAMFENCE_EFI = $savedEfi
+        $env:CARGO_PROFILE_RELEASE_STRIP = $savedStrip
+    }
 
     $version = (Select-String -Path ramfence-manager\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
     $dist = Join-Path $Root 'dist'
@@ -47,11 +67,18 @@ try {
     $out = Join-Path $dist "RAMFence-Manager-$version.exe"
     Copy-Item target\pkg\release\ramfence-manager.exe $out -Force
 
-    $efi = [IO.File]::ReadAllBytes((Join-Path $Root 'target\x86_64-unknown-uefi\release\ramfence.efi'))
+    $efi = [IO.File]::ReadAllBytes($efiPath)
     $exe = [IO.File]::ReadAllBytes($out)
-    # Sanity check: the exe must contain the embedded ramfence.efi marker.
-    if (-not [Text.Encoding]::ASCII.GetString($exe).Contains('RAMFENCE-FEATURES: memtest1')) {
+    $exeText = [Text.Encoding]::ASCII.GetString($exe)
+    # Sanity checks: the exe must contain the embedded ramfence.efi marker,
+    # and no local paths may be left in either binary.
+    if (-not $exeText.Contains('RAMFENCE-FEATURES: memtest1')) {
         throw 'ramfence.efi was not embedded into the manager'
+    }
+    foreach ($p in @($cargoHome, $Root, $env:USERPROFILE, ($Root -replace "[^A-Za-z0-9]", "_"))) {
+        if ($exeText.IndexOf($p, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "local path '$p' found in the release exe"
+        }
     }
     Write-Host ''
     Write-Host "Release: $out" -ForegroundColor Green
