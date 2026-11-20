@@ -3,7 +3,7 @@
 //! Format (ASCII, `;`-separated `key=value`):
 //!
 //! ```text
-//! version=1;ok=1;ranges=0x...-0x...,0x...-0x...;pages=N;type=unusable[;mode=scan-only][;error=...]
+//! version=1;ok=1;ranges=0x...-0x...,0x...-0x...;pages=N;type=unusable[;mode=scan-only|auto][;scan=stopped][;error=...]
 //! ```
 
 use alloc::string::String;
@@ -18,12 +18,16 @@ pub const STATUS_VERSION: u32 = 1;
 /// Builds the status string. `error` is a short human-readable summary when
 /// `ok` is false; `;` and non-printable/non-ASCII characters in it are
 /// replaced so the string stays parseable.
+///
+/// `scan_stopped`: an auto-mode scan ran during this boot but was stopped
+/// before it finished, so only the errors found so far are reserved.
 pub fn format_status(
     ok: bool,
     ranges: &[Range],
     pages: u64,
     memory_type: MemoryType,
     mode: Mode,
+    scan_stopped: bool,
     error: Option<&str>,
 ) -> String {
     let mut s = String::new();
@@ -38,6 +42,9 @@ pub fn format_status(
     let _ = write!(s, ";pages={pages};type={}", memory_type.name());
     if mode != Mode::Protect {
         let _ = write!(s, ";mode={}", mode.name());
+    }
+    if scan_stopped {
+        s.push_str(";scan=stopped");
     }
     if let Some(e) = error {
         s.push_str(";error=");
@@ -61,6 +68,8 @@ pub struct StatusInfo {
     pub memory_type: Option<MemoryType>,
     /// ramfence.efi ran in scan-only mode and reserved nothing on purpose.
     pub scan_only: bool,
+    /// An auto-mode scan was stopped before it finished during this boot.
+    pub scan_stopped: bool,
     pub error: Option<String>,
 }
 
@@ -75,6 +84,7 @@ pub fn parse_status(text: &str) -> Option<StatusInfo> {
     let mut pages = 0;
     let mut memory_type = None;
     let mut scan_only = false;
+    let mut scan_stopped = false;
     let mut error = None;
 
     for field in text.split(';') {
@@ -105,6 +115,7 @@ pub fn parse_status(text: &str) -> Option<StatusInfo> {
                 }
             }
             "mode" => scan_only = value == Mode::ScanOnly.name(),
+            "scan" => scan_stopped = value == "stopped",
             "error" => error = Some(String::from(value)),
             _ => {}
         }
@@ -117,6 +128,7 @@ pub fn parse_status(text: &str) -> Option<StatusInfo> {
         pages,
         memory_type,
         scan_only,
+        scan_stopped,
         error,
     })
 }
@@ -128,7 +140,7 @@ mod tests {
     #[test]
     fn parse_round_trips() {
         let ranges = [r(0x1000, 0x2000), r(0x5000, 0x6000)];
-        let s = format_status(false, &ranges, 2, MemoryType::Reserved, Mode::Protect, Some("x; y"));
+        let s = format_status(false, &ranges, 2, MemoryType::Reserved, Mode::Protect, false, Some("x; y"));
         assert_eq!(
             parse_status(&s),
             Some(StatusInfo {
@@ -138,10 +150,11 @@ mod tests {
                 pages: 2,
                 memory_type: Some(MemoryType::Reserved),
                 scan_only: false,
+                scan_stopped: false,
                 error: Some("x, y".into()),
             })
         );
-        let ok = format_status(true, &[r(0x1000, 0x2000)], 1, MemoryType::Unusable, Mode::Protect, None);
+        let ok = format_status(true, &[r(0x1000, 0x2000)], 1, MemoryType::Unusable, Mode::Protect, false, None);
         let mut with_nul = ok.clone();
         with_nul.push('\0');
         let parsed = parse_status(&with_nul).unwrap();
@@ -152,11 +165,20 @@ mod tests {
 
     #[test]
     fn scan_only_mode_round_trips() {
-        let s = format_status(true, &[], 0, MemoryType::Unusable, Mode::ScanOnly, None);
+        let s = format_status(true, &[], 0, MemoryType::Unusable, Mode::ScanOnly, false, None);
         assert_eq!(s, "version=1;ok=1;ranges=;pages=0;type=unusable;mode=scan-only");
         let info = parse_status(&s).unwrap();
         assert!(info.scan_only && info.ok && info.ranges.is_empty());
         assert!(!parse_status("version=1;ok=1").unwrap().scan_only);
+    }
+
+    #[test]
+    fn stopped_auto_scan_round_trips() {
+        let s = format_status(true, &[r(0x1000, 0x2000)], 1, MemoryType::Unusable, Mode::Auto, true, None);
+        assert_eq!(s, "version=1;ok=1;ranges=0x1000-0x2000;pages=1;type=unusable;mode=auto;scan=stopped");
+        let info = parse_status(&s).unwrap();
+        assert!(info.scan_stopped && info.ok && !info.scan_only);
+        assert!(!parse_status("version=1;ok=1;mode=auto").unwrap().scan_stopped);
     }
 
     #[test]
@@ -176,7 +198,7 @@ mod tests {
     #[test]
     fn ok_single_range() {
         assert_eq!(
-            format_status(true, &[r(0x1_0000_0000, 0x1_1000_0000)], 65536, MemoryType::Unusable, Mode::Protect, None),
+            format_status(true, &[r(0x1_0000_0000, 0x1_1000_0000)], 65536, MemoryType::Unusable, Mode::Protect, false, None),
             "version=1;ok=1;ranges=0x100000000-0x110000000;pages=65536;type=unusable"
         );
     }
@@ -190,6 +212,7 @@ mod tests {
                 1,
                 MemoryType::Reserved,
                 Mode::Protect,
+                false,
                 Some("BootServicesData at 0x5000; cannot allocate\n")
             ),
             "version=1;ok=0;ranges=0x1000-0x2000,0x5000-0x6000;pages=1;type=reserved;\
@@ -200,7 +223,7 @@ mod tests {
     #[test]
     fn no_ranges() {
         assert_eq!(
-            format_status(false, &[], 0, MemoryType::Unusable, Mode::Protect, Some("config missing")),
+            format_status(false, &[], 0, MemoryType::Unusable, Mode::Protect, false, Some("config missing")),
             "version=1;ok=0;ranges=;pages=0;type=unusable;error=config missing"
         );
     }

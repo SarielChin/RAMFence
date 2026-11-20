@@ -14,6 +14,7 @@ $script:RamFenceEfiPath = '\EFI\ramfence\ramfence.efi'
 $script:RamFenceInstallDir = Join-Path $env:ProgramFiles 'RAMFence'
 $script:RamFenceStateFile = Join-Path $script:RamFenceInstallDir 'state.json'
 $script:RamFenceLogFile = Join-Path $script:RamFenceInstallDir 'check.log'
+$script:RamFenceCfgFile = Join-Path $script:RamFenceInstallDir 'ramfence.cfg'
 $script:RamFenceTaskName = 'RAMFence boot check'
 
 function Assert-Admin {
@@ -188,6 +189,69 @@ function ConvertFrom-RamFenceStatus([string]$Text) {
         if ($i -gt 0) { $h[$part.Substring(0, $i)] = $part.Substring($i + 1) }
     }
     $h
+}
+
+# --- ranges ----------------------------------------------------------------------
+# A range is a two-element array @([UInt64]start, [UInt64]end), end exclusive.
+
+function ConvertFrom-HexAddress([string]$Text) {
+    [UInt64]::Parse(($Text.Substring(2) -replace '_', ''), 'AllowHexSpecifier')
+}
+
+# Ranges of a protect-mode ramfence.cfg, aligned outward to 4 KiB pages like
+# ramfence.efi does. Empty for scan-only/auto mode or a missing file.
+function Get-RamFenceConfigRanges([string]$Path) {
+    $list = @()
+    if (-not (Test-Path $Path)) { return , $list }
+    $mode = 'protect'
+    $page = [UInt64]4096
+    foreach ($raw in (Get-Content $Path)) {
+        $parts = @((($raw -replace '#.*$', '').Trim()) -split '\s+')
+        if ($parts[0] -ceq 'mode' -and $parts.Count -eq 2) { $mode = $parts[1] }
+        if ($parts[0] -ceq 'range' -and $parts.Count -eq 3) {
+            $s = ConvertFrom-HexAddress $parts[1]
+            $e = ConvertFrom-HexAddress $parts[2]
+            $s = [UInt64]($s - ($s % $page))
+            if ($e % $page) { $e = [UInt64]($e + ($page - ($e % $page))) }
+            $list += , @($s, $e)
+        }
+    }
+    if ($mode -ne 'protect') { return , @() }
+    , $list
+}
+
+# The "ranges" field of RamFenceStatus ("0xA-0xB,0xC-0xD") as ranges.
+function ConvertFrom-StatusRanges([string]$Text) {
+    $list = @()
+    foreach ($part in ($Text -split ',')) {
+        if (-not $part) { continue }
+        $ab = $part -split '-'
+        $list += , @((ConvertFrom-HexAddress $ab[0]), (ConvertFrom-HexAddress $ab[1]))
+    }
+    , $list
+}
+
+# Parts of the ranges in $Needed that no range in $Have covers, as
+# "0xA-0xB" strings.
+function Get-UncoveredRanges($Needed, $Have) {
+    $out = @()
+    foreach ($n in $Needed) {
+        $cur = [UInt64]$n[0]
+        $end = [UInt64]$n[1]
+        while ($cur -lt $end) {
+            $cover = @($Have | Where-Object { $_[0] -le $cur -and $cur -lt $_[1] })
+            if ($cover.Count) {
+                foreach ($c in $cover) { if ([UInt64]$c[1] -gt $cur) { $cur = [UInt64]$c[1] } }
+                continue
+            }
+            $next = @($Have | Where-Object { $_[0] -gt $cur -and $_[0] -lt $end } | ForEach-Object { $_[0] } |
+                Sort-Object | Select-Object -First 1)
+            $gapEnd = if ($next.Count) { [UInt64]$next[0] } else { $end }
+            $out += ('0x{0:x}-0x{1:x}' -f $cur, $gapEnd)
+            $cur = $gapEnd
+        }
+    }
+    , $out
 }
 
 # --- state -----------------------------------------------------------------------

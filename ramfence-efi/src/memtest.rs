@@ -23,6 +23,7 @@ use uefi::mem::memory_map::MemoryType;
 use uefi::{CString16, print, println};
 
 use crate::console::{self, Log};
+use crate::machine;
 use crate::reserve::{self, CHUNK_PAGES};
 
 struct Phys {
@@ -138,19 +139,48 @@ fn save_result(dir: &str, path: &CString16, result: &TestResult, log: &mut Log) 
     }
 }
 
-/// `mode auto` (rescue USB): use the saved result next to ramfence.efi, or
-/// scan all memory once and save it. Returns the ranges to reserve (error
-/// clusters plus [`AUTO_MARGIN`]) and whether a scan ran this boot.
-pub fn auto(dir: &str, log: &mut Log) -> (Vec<Range>, bool) {
+/// What `mode auto` decided during this boot.
+#[derive(Default)]
+pub struct AutoOutcome {
+    /// Error clusters plus [`AUTO_MARGIN`]: the ranges to reserve.
+    pub ranges: Vec<Range>,
+    /// A scan ran during this boot.
+    pub scanned: bool,
+    /// That scan was stopped before it finished: only the errors found so
+    /// far are in `ranges`.
+    pub stopped: bool,
+}
+
+/// `mode auto` (rescue USB): use the saved result next to ramfence.efi if it
+/// was made on this PC with this memory, else scan all memory and save the
+/// result.
+pub fn auto(dir: &str, log: &mut Log) -> AutoOutcome {
     let Some(res_path) = path16(dir, RESULT_FILE) else {
         log.error("auto mode: invalid result path");
-        return (Vec::new(), false);
+        return AutoOutcome::default();
     };
+    let here = machine::id();
     let saved = open_fs()
         .ok()
         .and_then(|mut fs| fs.read(&*res_path).ok())
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|t| memtest::parse_result(&t));
+    // A saved result is only valid for the PC and memory it was made on, and
+    // only if the scan finished and the file is complete.
+    let saved = match saved {
+        Some(r) if r.machine != Some(here) => {
+            log.info(
+                "Auto mode: the saved scan result does not match this PC and its memory \
+                 (another PC, changed memory or firmware, or an older version); scanning again.",
+            );
+            None
+        }
+        Some(r) if !r.completed || !r.ended => {
+            log.info("Auto mode: the saved scan result is incomplete; scanning again.");
+            None
+        }
+        r => r,
+    };
 
     let (result, scanned) = match saved {
         Some(r) => {
@@ -164,11 +194,11 @@ pub fn auto(dir: &str, log: &mut Log) -> (Vec<Range>, bool) {
             let extent = reserve::read_map().ok().and_then(|m| memmap::ram_extent(&m));
             let Some(extent) = extent else {
                 log.error("auto mode: cannot determine the memory size to scan");
-                return (Vec::new(), false);
+                return AutoOutcome::default();
             };
             log.info("");
             log.info(format_args!(
-                "Auto mode: first start, scanning all memory ({} MiB). This takes a few minutes.",
+                "Auto mode: scanning all memory ({} MiB). This takes a few minutes.",
                 extent.len() >> 20
             ));
             let r = run(&[extent], 1, log);
@@ -186,20 +216,27 @@ pub fn auto(dir: &str, log: &mut Log) -> (Vec<Range>, bool) {
     let ranges = result
         .errors
         .suggested_ranges(AUTO_MARGIN, 1 << 20, memtest::SUGGEST_GAP);
+    let stopped = scanned && !result.completed;
     if ranges.is_empty() {
-        log.info("Auto mode: no bad memory found; nothing to reserve.");
+        if stopped {
+            log.warn("Auto mode: no bad memory found before the scan was stopped; nothing reserved.");
+        } else {
+            log.info("Auto mode: no bad memory found; nothing to reserve.");
+        }
     }
-    (ranges, scanned)
+    AutoOutcome { ranges, scanned, stopped }
 }
 
 fn run(ranges: &[Range], passes: u32, log: &mut Log) -> TestResult {
     let mut result = TestResult {
         completed: false,
         passes,
+        machine: Some(machine::id()),
         requested: ranges.to_vec(),
         tested: Vec::new(),
         untested: Vec::new(),
         errors: Default::default(),
+        ended: false,
     };
 
     let map = match reserve::read_map() {

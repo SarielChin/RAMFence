@@ -8,7 +8,9 @@
         Missing  -> this boot was NOT protected (boot order changed, or the
                     firmware rejected ramfence.efi): alert, restart needed.
         ok=0     -> ramfence.efi reported an error: alert with the message.
-        ok=1     -> protected.
+        ok=1     -> protected, unless a configured range was not reserved
+                    (booted from another copy, e.g. a rescue USB stick) or
+                    an auto-mode scan was stopped.
       - Makes sure the RAMFence entry is still first in the firmware boot
         order and restores it if Windows Update moved it (unless -NoFix).
 
@@ -85,8 +87,33 @@ try {
         Show-Alert ("ramfence.efi reported an error during boot; bad memory may not be fully protected.`n`n$err" +
             $(if ($orderNote) { "`n`n$orderNote" } else { '' })) 'Error'
     } else {
-        Write-CheckLog "OK: ranges=$($status.Fields['ranges']) pages=$($status.Fields['pages']) type=$($status.Fields['type'])"
-        if ($orderNote) { Show-Alert $orderNote }
+        # ok=1 only says that what this boot was asked to reserve is reserved.
+        # Compare with the installed configuration: a boot from another copy
+        # of ramfence.efi (e.g. a rescue USB stick) may have reserved less.
+        $missing = @()
+        if ($status.Fields.ContainsKey('mode') -and $status.Fields['mode'] -eq 'scan-only') {
+            Write-CheckLog 'Scan-only mode (setup not finished): nothing is reserved'
+        } else {
+            $have = @(if ($status.Fields.ContainsKey('ranges')) { ConvertFrom-StatusRanges $status.Fields['ranges'] })
+            $missing = @(Get-UncoveredRanges (Get-RamFenceConfigRanges $RamFenceCfgFile) $have)
+        }
+        if ($missing.Count) {
+            $exitCode = 3
+            $list = $missing -join ', '
+            Write-CheckLog "PROBLEM: configured range(s) not reserved by this boot: $list  [$($status.Raw)]"
+            Show-Alert ("This boot did not reserve the configured range(s) $list, so bad memory may be in use right now.`n`n" +
+                "It probably started from another copy of ramfence.efi (for example a rescue USB stick), " +
+                "or the configuration on the EFI System Partition differs from the installed one." +
+                $(if ($orderNote) { "`n`n$orderNote" } else { '' })) 'Error'
+        } elseif ($status.Fields.ContainsKey('scan') -and $status.Fields['scan'] -eq 'stopped') {
+            $exitCode = 3
+            Write-CheckLog "PROBLEM: the auto-mode memory scan was stopped; only errors found so far are reserved  [$($status.Raw)]"
+            Show-Alert ("The memory scan was stopped before it finished, so only the errors found so far are reserved." +
+                $(if ($orderNote) { "`n`n$orderNote" } else { '' })) 'Error'
+        } else {
+            Write-CheckLog "OK: ranges=$($status.Fields['ranges']) pages=$($status.Fields['pages']) type=$($status.Fields['type'])"
+            if ($orderNote) { Show-Alert $orderNote }
+        }
     }
 } catch {
     $exitCode = 1

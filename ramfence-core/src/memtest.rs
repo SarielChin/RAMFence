@@ -186,10 +186,15 @@ pub struct Untested {
 pub struct TestResult {
     pub completed: bool,
     pub passes: u32,
+    /// [`crate::machine::machine_id`] of the PC that ran the test, if recorded.
+    pub machine: Option<u64>,
     pub requested: Vec<Range>,
     pub tested: Vec<Range>,
     pub untested: Vec<Untested>,
     pub errors: ErrorLog,
+    /// Set by [`parse_result`] when the file ends with the `end` line, i.e. it
+    /// was not cut short (for example by a power loss while it was written).
+    pub ended: bool,
 }
 
 impl TestResult {
@@ -202,6 +207,9 @@ impl TestResult {
         let _ = writeln!(s, "ramfence-test 1");
         let _ = writeln!(s, "result {}", if self.completed { "complete" } else { "aborted" });
         let _ = writeln!(s, "passes {}", self.passes);
+        if let Some(m) = self.machine {
+            let _ = writeln!(s, "machine {m:#018x}");
+        }
         for r in &self.requested {
             let _ = writeln!(s, "requested {:#x} {:#x}", r.start(), r.end());
         }
@@ -225,6 +233,7 @@ impl TestResult {
         for x in &e.samples {
             let _ = writeln!(s, "error {:#x} {:#018x} {:#018x}", x.addr, x.expected, x.actual);
         }
+        let _ = writeln!(s, "end");
         s
     }
 }
@@ -238,10 +247,12 @@ pub fn parse_result(text: &str) -> Option<TestResult> {
     let mut r = TestResult {
         completed: false,
         passes: 0,
+        machine: None,
         requested: Vec::new(),
         tested: Vec::new(),
         untested: Vec::new(),
         errors: ErrorLog::default(),
+        ended: false,
     };
     let addr = |s: &str| parse_address(s).ok();
     let range = |a: &str, b: &str| Range::new(addr(a)?, addr(b)?).ok();
@@ -250,6 +261,8 @@ pub fn parse_result(text: &str) -> Option<TestResult> {
         match (p[0], p.len()) {
             ("result", 2) => r.completed = p[1] == "complete",
             ("passes", 2) => r.passes = p[1].parse().ok()?,
+            ("machine", 2) => r.machine = Some(addr(p[1])?),
+            ("end", 1) => r.ended = true,
             ("requested", 3) => r.requested.push(range(p[1], p[2])?),
             ("tested", 3) => r.tested.push(range(p[1], p[2])?),
             ("untested", 4) => r.untested.push(Untested { range: range(p[1], p[2])?, reason: p[3].into() }),
@@ -651,10 +664,12 @@ mod tests {
         let res = TestResult {
             completed: true,
             passes: 2,
+            machine: Some(0x0123_4567_89ab_cdef),
             requested: vec![r(0x1_0000_0000, 0x1_1000_0000)],
             tested: vec![r(0x1_0000_0000, 0x1_0400_0000), r(0x1_0500_0000, 0x1_1000_0000)],
             untested: vec![Untested { range: r(0x1_0400_0000, 0x1_0500_0000), reason: "BootServicesData in use".into() }],
             errors,
+            ended: true,
         };
         let text = res.to_text();
         assert!(text.starts_with("ramfence-test 1\nresult complete\n"));
@@ -664,5 +679,14 @@ mod tests {
 
         let aborted = TestResult { completed: false, errors: ErrorLog::default(), ..res };
         assert_eq!(parse_result(&aborted.to_text()), Some(aborted));
+
+        // Cut short: still parsed, but `ended` is false.
+        let cut = text.split("\nerror ").next().unwrap();
+        let parsed = parse_result(cut).unwrap();
+        assert!(!parsed.ended);
+        assert_eq!(parsed.machine, Some(0x0123_4567_89ab_cdef));
+        // Older files without a machine line.
+        let old = text.replace("machine 0x0123456789abcdef\n", "");
+        assert_eq!(parse_result(&old).unwrap().machine, None);
     }
 }

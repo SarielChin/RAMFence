@@ -21,7 +21,8 @@ See `README.md` for how it works and how it is used.
 - QEMU tests: `tools\qemu-test.ps1 -Case <case>` (needs QEMU with its bundled
   OVMF/edk2 firmware; the `conflict` and `halt` cases also need
   `-ConflictRange` set to a BS_Data region from the `ok` case's memmap). Check
-  the result in `target\qemu\<case>\serial.txt`.
+  the result in `target\qemu\<case>\serial.txt`. Run `memtest` before
+  `auto-saved`, which takes the guest's machine id from the `memtest` log.
 
 ## Design notes
 
@@ -51,6 +52,10 @@ Non-obvious decisions; keep them unless there is a tested reason to change.
   through ramfence.efi. Its text format (`version=1;ok=…;ranges=…;…`, see
   `ramfence-core/src/status.rs`) is a contract between ramfence.efi, the
   manager and `windows\check.ps1`: change it compatibly or bump `version`.
+- **Saved scan results** (`test-result.txt`) carry a machine id (SMBIOS +
+  RAM extent, `ramfence-core/src/machine.rs`). Auto mode (rescue USB) only
+  reuses a result that finished, is complete (`end` line) and has this
+  machine's id; otherwise it scans again.
 - **Two Windows-side implementations:** RAMFence Manager (Rust) and the
   PowerShell scripts in `windows\` install, check and uninstall the same way.
   Keep these in sync: ESP folder, install folder, boot entry name, task name,

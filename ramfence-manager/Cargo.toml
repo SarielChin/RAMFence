@@ -1,6 +1,6 @@
 [package]
 name = "ramfence-manager"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 license.workspace = true
 description = "Windows GUI to install, configure, check and uninstall ramfence.efi."

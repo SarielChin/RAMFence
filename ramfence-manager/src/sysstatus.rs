@@ -2,7 +2,7 @@
 //! independent; failures are recorded instead of aborting.
 
 use ramfence_core::status::{StatusInfo, parse_status};
-use ramfence_core::{Config, Range, config, range};
+use ramfence_core::{Config, Mode, Range, config, range};
 
 use crate::paths::{STATUS_VARIABLE, STATUS_VENDOR_GUID, installed_cfg};
 use crate::state::{self, State};
@@ -61,10 +61,32 @@ impl SystemStatus {
         }
     }
 
-    /// Parts of the protected ranges Windows uses (should be empty).
+    /// Ranges the installed protect-mode configuration asks for (empty for
+    /// other modes or if it cannot be read).
+    pub fn configured_ranges(&self) -> Vec<Range> {
+        match &self.installed_config {
+            Some(Ok(c)) if c.mode == Mode::Protect => range::normalize(&c.ranges).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Parts of the reported and the configured ranges that Windows uses
+    /// (should be empty).
     pub fn overlaps(&self) -> Option<Vec<Range>> {
         let win = self.windows_ranges.as_ref().ok()?;
-        Some(physmem::overlaps(win, &self.protected_ranges()))
+        let mut all = self.protected_ranges();
+        all.extend(self.configured_ranges());
+        let all = range::normalize(&all).unwrap_or(all);
+        Some(physmem::overlaps(win, &all))
+    }
+
+    /// Configured ranges this boot did not reserve (should be empty). Only
+    /// meaningful when ramfence.efi ran and reported success.
+    pub fn missing_ranges(&self) -> Vec<Range> {
+        match &self.ramfence {
+            Some(info) if info.ok && !info.scan_only => range::subtract(&self.configured_ranges(), &info.ranges),
+            _ => Vec::new(),
+        }
     }
 
     pub fn ramfence_first(&self) -> Option<bool> {
@@ -76,6 +98,16 @@ impl SystemStatus {
     pub fn verdict(&self) -> Verdict {
         if !self.elevated {
             return Verdict::Unknown("run as administrator to read the boot status".into());
+        }
+        let missing = self.missing_ranges();
+        if !missing.is_empty() {
+            let list: Vec<String> = missing.iter().map(|r| r.to_string()).collect();
+            return Verdict::Problem(format!(
+                "this boot did not reserve the configured range(s) {}. It probably started from another \
+                 copy of ramfence.efi (for example a rescue USB stick), or the configuration on the EFI \
+                 System Partition differs from the installed one.",
+                list.join(", ")
+            ));
         }
         if let Some(o) = self.overlaps()
             && !o.is_empty()
@@ -89,6 +121,11 @@ impl SystemStatus {
             (Ok(None), _) => Verdict::NotProtected,
             (Ok(Some(raw)), None) => Verdict::Problem(format!("unreadable RamFenceStatus: {raw}")),
             (Ok(Some(_)), Some(info)) if info.ok && info.scan_only => Verdict::ScanOnly,
+            (Ok(Some(_)), Some(info)) if info.ok && info.scan_stopped => Verdict::Problem(
+                "the memory scan of the rescue USB stick was stopped before it finished, so only the \
+                 errors found so far are reserved. Start from the stick again and let the scan finish."
+                    .into(),
+            ),
             (Ok(Some(_)), Some(info)) if !info.ok => Verdict::Problem(format!(
                 "ramfence.efi reported an error: {}",
                 info.error.as_deref().unwrap_or("(no details)")
@@ -230,5 +267,46 @@ mod tests {
         let mut s = base();
         s.ramfence = parse_status("version=1;ok=1;ranges=;pages=0;type=unusable;mode=scan-only");
         assert_eq!(s.verdict(), Verdict::ScanOnly);
+    }
+
+    fn cfg(text: &str) -> Option<Result<Config, String>> {
+        Some(config::parse(text).map_err(|e| e.to_string()))
+    }
+
+    #[test]
+    fn verdict_compares_with_installed_config() {
+        // The installed config matches what this boot reserved.
+        let mut s = base();
+        s.installed_config = cfg("range 0x10000 0x20000\n");
+        assert_eq!(s.verdict(), Verdict::Protected);
+
+        // Booted from another copy (e.g. a rescue USB stick that found
+        // nothing): ok=1 but the configured range was not reserved.
+        let mut s = base();
+        s.installed_config = cfg("range 0x10000 0x20000\n");
+        s.ramfence = parse_status("version=1;ok=1;ranges=;pages=0;type=unusable;mode=auto");
+        s.windows_ranges = Ok(vec![]);
+        assert_eq!(s.missing_ranges(), vec![Range::new(0x10000, 0x20000).unwrap()]);
+        assert!(matches!(s.verdict(), Verdict::Problem(p) if p.contains("0x10000-0x20000")));
+
+        // Windows uses a configured range that this boot did not report.
+        let mut s = base();
+        s.installed_config = cfg("range 0x10000 0x20000\nrange 0x30000 0x40000\n");
+        s.windows_ranges = Ok(vec![Range::new(0x30000, 0x40000).unwrap()]);
+        assert!(matches!(s.verdict(), Verdict::Problem(_)));
+
+        // Non-protect configs have no ranges to compare.
+        let mut s = base();
+        s.installed_config = cfg("mode scan-only\n");
+        assert!(s.configured_ranges().is_empty());
+        assert_eq!(s.verdict(), Verdict::Protected);
+    }
+
+    #[test]
+    fn stopped_scan_is_a_problem() {
+        let mut s = base();
+        s.state = None;
+        s.ramfence = parse_status("version=1;ok=1;ranges=0x10000-0x20000;pages=16;type=unusable;mode=auto;scan=stopped");
+        assert!(matches!(s.verdict(), Verdict::Problem(p) if p.contains("stopped")));
     }
 }

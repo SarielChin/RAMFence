@@ -171,12 +171,48 @@ pub fn total_pages(ranges: &[Range]) -> u64 {
     ranges.iter().map(Range::pages).sum()
 }
 
+/// The parts of `a` that no range in `b` covers.
+pub fn subtract(a: &[Range], b: &[Range]) -> Vec<Range> {
+    let mut out: Vec<Range> = a.to_vec();
+    for y in b {
+        let mut next = Vec::with_capacity(out.len() + 1);
+        for x in out {
+            if !x.overlaps(y) {
+                next.push(x);
+                continue;
+            }
+            if let Ok(left) = Range::new(x.start, y.start) {
+                next.push(left);
+            }
+            if let Ok(right) = Range::new(y.end, x.end) {
+                next.push(right);
+            }
+        }
+        out = next;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn r(start: u64, end: u64) -> Range {
         Range::new(start, end).unwrap()
+    }
+
+    #[test]
+    fn subtract_ranges() {
+        let a = [r(0x1000, 0x9000)];
+        assert_eq!(subtract(&a, &[]), a.to_vec());
+        assert_eq!(subtract(&a, &[r(0, 0x10000)]), Vec::<Range>::new());
+        assert_eq!(subtract(&a, &[r(0x3000, 0x4000)]), vec![r(0x1000, 0x3000), r(0x4000, 0x9000)]);
+        assert_eq!(subtract(&a, &[r(0, 0x2000), r(0x8000, 0xa000)]), vec![r(0x2000, 0x8000)]);
+        assert_eq!(subtract(&a, &[r(0x9000, 0xa000)]), a.to_vec());
+        assert_eq!(
+            subtract(&[r(0, 0x1000), r(0x5000, 0x6000)], &[r(0x800, 0x5800)]),
+            vec![r(0, 0x800), r(0x5800, 0x6000)]
+        );
     }
 
     #[test]

@@ -1231,9 +1231,20 @@ impl ManagerApp {
             Some(i) if !s.installed() && i.ok && !i.scan_only => Some(i.ranges.clone()),
             _ => None,
         };
-        let found = result.as_ref().is_some_and(|r| r.completed) || protect_configured || usb_ranges.is_some();
+        // The stick's scan was stopped: its ranges are incomplete.
+        let usb_stopped = usb_ranges.is_some() && s.ramfence.as_ref().is_some_and(|i| i.scan_stopped);
+        let found = result.as_ref().is_some_and(|r| r.completed)
+            || protect_configured
+            || (usb_ranges.is_some() && !usb_stopped);
         step_header(ui, 2, "Find the bad memory", found);
         ui.indent("step2", |ui| {
+            if usb_stopped {
+                check_line(ui, Level::Warn,
+                    "This start used a RAMFence rescue USB stick, but its memory scan was stopped before it \
+                     finished. Only the errors found so far are reserved. Start from the stick again and let \
+                     the scan finish.");
+                return;
+            }
             if let Some(r) = &usb_ranges {
                 let total: u64 = r.iter().map(Range::len).sum();
                 check_line(ui, Level::Good, &if r.is_empty() {
@@ -1315,6 +1326,10 @@ impl ManagerApp {
         let protected_now = verdict == Verdict::Protected;
         step_header(ui, 3, "Protect the bad memory", protect_configured);
         ui.indent("step3", |ui| {
+            if usb_stopped {
+                ui.label(RichText::new("Finish step 2 first: the scan must complete before RAMFence is installed with its result.").weak());
+                return;
+            }
             if let Some(r) = usb_ranges.as_ref().filter(|r| !r.is_empty()) {
                 ui.label("Install RAMFence on this PC with the ranges the USB stick found, so the stick is no longer needed:");
                 for x in r {
@@ -1379,12 +1394,28 @@ impl ManagerApp {
                 }
                 return;
             }
-            if protect_configured {
+            // With ranges already protected, add the new ones: a single scan may
+            // miss errors that the existing ranges cover, so never drop them here.
+            // (Shrinking is the confirmed "Update to these ranges" path above.)
+            let (label, target) = if protect_configured {
                 check_line(ui, Level::Warn, "Some errors are outside the protected ranges.");
-            }
-            let label = if protect_configured { "Protect these ranges instead" } else { "Protect these ranges" };
-            if ui.add_enabled(s.installed() && !busy && !suggested.is_empty(), egui::Button::new(RichText::new(label).strong())).clicked() {
-                self.start_job(ui.ctx(), "Protect bad memory", move |log| ops::protect_ranges(&suggested, log));
+                let mut both = current.clone();
+                both.extend_from_slice(&suggested);
+                ("Add these ranges", range::normalize(&both).unwrap_or(both))
+            } else {
+                ("Protect these ranges", suggested.clone())
+            };
+            let resp = ui.add_enabled(
+                s.installed() && !busy && !suggested.is_empty(),
+                egui::Button::new(RichText::new(label).strong()),
+            );
+            let resp = if protect_configured {
+                resp.on_hover_text("Keeps the ranges already protected and adds these.")
+            } else {
+                resp
+            };
+            if resp.clicked() {
+                self.start_job(ui.ctx(), "Protect bad memory", move |log| ops::protect_ranges(&target, log));
             }
         });
         ui.add_space(10.0);

@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod chainload;
 mod console;
+mod machine;
 mod memtest;
 mod reserve;
 
@@ -76,6 +77,7 @@ fn main() -> Status {
     let mode = config.as_ref().map_or(Mode::Protect, |c| c.mode);
     let mut ranges: Vec<Range> = Vec::new();
     let mut outcome = reserve::Outcome::default();
+    let mut scan_stopped = false;
     if mode == Mode::ScanOnly {
         // Explicitly configured (the bad ranges are not known yet), so not
         // an error; but say clearly that nothing is protected.
@@ -84,9 +86,10 @@ fn main() -> Status {
         if mode == Mode::Auto {
             match image_dir() {
                 Ok(dir) => {
-                    let (found, scanned) = memtest::auto(&dir, &mut log);
-                    ranges = found;
-                    tested |= scanned;
+                    let auto = memtest::auto(&dir, &mut log);
+                    ranges = auto.ranges;
+                    tested |= auto.scanned;
+                    scan_stopped = auto.stopped;
                 }
                 Err(e) => log.error(format_args!("auto mode: {e}")),
             }
@@ -114,6 +117,7 @@ fn main() -> Status {
         outcome.protected,
         mem_type,
         mode,
+        scan_stopped,
         log.first_error(),
     );
     if let Err(e) = set_status_variable(&status_text) {

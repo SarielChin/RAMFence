@@ -22,7 +22,7 @@
 #>
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('ok', 'reserved', 'missing-config', 'parse-error', 'conflict', 'halt', 'memtest', 'scan-only', 'auto-scan', 'auto-saved')]
+    [ValidateSet('ok', 'reserved', 'missing-config', 'parse-error', 'conflict', 'halt', 'memtest', 'scan-only', 'auto-scan', 'auto-saved', 'auto-mismatch', 'auto-stopped')]
     [string]$Case,
 
     # "0xSTART 0xEND" for the conflict/halt cases: pick a BS_Data region
@@ -49,6 +49,9 @@ $TestRanges = @'
 range 0x40000000 0x48000000
 range 0x50000123 0x50000fff   # unaligned: expands to one page
 '@
+
+# A saved scan result with two errors, for the auto-mode cases.
+$SavedResult = "ramfence-test 1`nresult complete`npasses 1`nrequested 0x100000 0x80000000`ntested 0x100000 0x80000000`nerrors 2`nmask 0x0000ff0000000000`nlowest 0x30000100`nhighest 0x30800000`nbucket 0x30000000 2`nerror 0x30000100 0x30000100 0x0000ff0030000100`nerror 0x30800000 0x30800000 0x0000ff0030800000`nend`n"
 
 $Cases = @{
     'ok'             = @{
@@ -103,10 +106,29 @@ $Cases = @{
     'auto-saved'     = @{
         # Rescue USB, later start: the saved result (with two errors) is
         # used without scanning; error cluster + 256 MiB margin reserved:
-        # expect Unusable 0x20000000-0x408FFFFF.
-        Cfg    = "mode auto`non_error boot`ntimeout 0`nchainload $Missing`n"
-        Result = "ramfence-test 1`nresult complete`npasses 1`nrequested 0x100000 0x80000000`ntested 0x100000 0x80000000`nerrors 2`nmask 0x0000ff0000000000`nlowest 0x30000100`nhighest 0x30800000`nbucket 0x30000000 2`nerror 0x30000100 0x30000100 0x0000ff0030000100`nerror 0x30800000 0x30800000 0x0000ff0030800000`n"
-        Keys   = @()
+        # expect Unusable 0x20000000-0x408FFFFF. The result must carry this
+        # guest's machine id, taken from the 'memtest' case (same 2G guest):
+        # run that case first.
+        Cfg         = "mode auto`non_error boot`ntimeout 0`nchainload $Missing`n"
+        Result      = $SavedResult
+        MachineFrom = 'memtest'
+        Keys        = @()
+    }
+    'auto-mismatch'  = @{
+        # Rescue USB moved to another PC: the saved result's machine id does
+        # not match, so it is ignored and all RAM is scanned again (nothing
+        # reserved, a new result with this guest's id is saved).
+        Cfg     = "mode auto`non_error boot`ntimeout 0`nchainload $Missing`n"
+        Result  = $SavedResult.Replace("passes 1`n", "passes 1`nmachine 0x0000000000000001`n")
+        Mem     = '768M'
+        Keys    = @()
+    }
+    'auto-stopped'   = @{
+        # Esc during the auto-mode scan: nothing saved, status says
+        # scan=stopped so Windows can warn.
+        Cfg  = "mode auto`non_error boot`ntimeout 0`nchainload $Missing`n"
+        Mem  = '768M'
+        Keys = @(@{ Wait = 'Esc = abort'; Key = 'esc'; Delay = 2 })
     }
     'halt'           = @{
         Cfg  = "range $ConflictRange`non_error halt`ntimeout 0`nchainload $Missing`n"
@@ -151,7 +173,21 @@ function Write-Ascii([string]$Path, [string]$Text) {
 Copy-Item $Efi (Join-Path $Esp 'EFI\ramfence\ramfence.efi')
 if ($null -ne $Spec.Cfg) { Write-Ascii (Join-Path $Esp 'EFI\ramfence\ramfence.cfg') $Spec.Cfg }
 if ($Spec.ContainsKey('TestReq')) { Write-Ascii (Join-Path $Esp 'EFI\ramfence\test.req') $Spec.TestReq }
-if ($Spec.ContainsKey('Result')) { Write-Ascii (Join-Path $Esp 'EFI\ramfence\test-result.txt') $Spec.Result }
+if ($Spec.ContainsKey('Result')) {
+    $result = $Spec.Result
+    if ($Spec.ContainsKey('MachineFrom')) {
+        # From the serial log, where the guest prints the saved result: QEMU
+        # does not reliably write the guest's files back to the host folder.
+        $src = Join-Path $Root "target\qemu\$($Spec.MachineFrom)\serial.txt"
+        $line = if (Test-Path $src) {
+            Get-Content $src | ForEach-Object { $_.Trim() } |
+                Where-Object { $_ -match '^machine 0x[0-9a-f]{16}$' } | Select-Object -First 1
+        }
+        if (-not $line) { throw "No machine id in ${src}: run -Case $($Spec.MachineFrom) first." }
+        $result = $result.Replace("passes 1`n", "passes 1`n$line`n")
+    }
+    Write-Ascii (Join-Path $Esp 'EFI\ramfence\test-result.txt') $result
+}
 $Mem = if ($Spec.ContainsKey('Mem')) { $Spec.Mem } else { '2G' }
 if ($Spec.Stage2) {
     New-Item -ItemType Directory -Force (Join-Path $Esp 'EFI\stage2') | Out-Null

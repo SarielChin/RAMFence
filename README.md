@@ -130,7 +130,9 @@ If the PC crashes before or while Windows starts:
 2. On the affected PC, turn Secure Boot off, then start from the stick (boot
    menu, often F12, F11, F8, Esc or F10 at the maker's logo).
 3. The first start scans all memory and saves the result on the stick; it then
-   reserves the damaged areas and starts Windows. Later starts reuse the result.
+   reserves the damaged areas and starts Windows. Later starts on the same PC
+   reuse the result; on another PC, or after a memory or firmware change, the
+   stick scans again.
 4. In Windows, run `RAMFence-Manager.exe` from the stick. The Setup tab offers to
    install RAMFence with the ranges the stick found.
 
@@ -153,7 +155,7 @@ timeout 3                       # seconds the summary stays on screen
 |---|---|
 | `protect` | Reserve the configured ranges (normal use). |
 | `scan-only` | Reserve nothing; only run a scheduled memory test. Used while setting up. |
-| `auto` | Rescue USB: scan once if no saved result exists, then reserve the error ranges from the result plus a 256 MiB margin. |
+| `auto` | Rescue USB: scan all memory unless a complete result saved on this PC with this memory exists, then reserve the error ranges from the result plus a 256 MiB margin. |
 
 ## The memory test
 
