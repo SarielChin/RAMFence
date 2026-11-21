@@ -74,7 +74,7 @@ fn main() {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("RAMFence Manager")
+            .with_title(concat!("RAMFence Manager ", env!("CARGO_PKG_VERSION")))
             .with_inner_size([860.0, 720.0])
             .with_min_inner_size([640.0, 480.0]),
         ..Default::default()
